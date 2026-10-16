@@ -3,7 +3,7 @@
 Goal: per-pixel motion vectors for every 3D surface Wipeout XL draws, saying
 where each pixel was in the **previous game frame**. They're needed for DLSS
 (any mode) and Streamline, and they replace the optical-flow guesses the ReShade
-DLSS tools use today. Status: **plan only, nothing built yet** (2026-10-16).
+DLSS tools use today. Status: **Phase 0 done, verdict go** (2026-10-16; see [motion-vectors-phase0.md](motion-vectors-phase0.md)). Phase 1 next.
 
 ## What we already have
 
