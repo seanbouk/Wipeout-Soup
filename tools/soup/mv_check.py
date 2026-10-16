@@ -16,10 +16,12 @@ import glob, os, sys
 import numpy as np
 
 def load(base):
-    w, h, s, frame = map(int, open(base + ".txt").read().split())
+    f = list(map(int, open(base + ".txt").read().split()))
+    w, h, s, frame = f[:4]
+    reset = f[4] if len(f) > 4 else 0
     rgb = np.fromfile(base + ".rgba", np.uint8).reshape(h, w, 4)[..., :3].astype(np.float32)
     mv = np.fromfile(base + ".mv", np.float32).reshape(h, w, 4)
-    return {"w": w, "h": h, "s": s, "frame": frame, "rgb": rgb, "mv": mv}
+    return {"w": w, "h": h, "s": s, "frame": frame, "reset": reset, "rgb": rgb, "mv": mv}
 
 def sample(img, x, y):
     """Bilinear lookup; returns values and an in-bounds mask."""
@@ -47,9 +49,13 @@ def main():
     d = sys.argv[1]; images = "--images" in sys.argv
     frames = [load(p[:-4]) for p in sorted(glob.glob(os.path.join(d, "f*.txt")))]
     ks = [-1, 0, 0.5, 0.8, 1, 1.25, 1.5, 2]
-    rows = []
+    rows, resets = [], []
     for a, b in zip(frames, frames[1:]):
         if b["frame"] != a["frame"] + 1 or a["rgb"].shape != b["rgb"].shape:
+            continue
+        if b["reset"]:                     # history reset (camera cut): not scored
+            resets.append((b["frame"], (b["mv"][..., 2] > 0.5).mean() * 100,
+                           float(np.abs(b["mv"][..., :2]).max())))
             continue
         s = b["s"]; h, w = b["h"], b["w"]
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -76,9 +82,15 @@ def main():
     print("frames      motion   median speed  best   error at k=0 (still) / k=1 (motion)")
     print("            cover    (native px)   k")
     for fa, fb, cov, spd, errs in rows:
+        if np.all(np.isnan(errs)):
+            print("%4d->%-4d  %5.1f%%   nothing to score (no textured pixel changed)" % (fa, fb, cov))
+            continue
         best = ks[int(np.nanargmin(errs))]
         print("%4d->%-4d  %5.1f%%   %6.2f        %-5g  %6.2f / %6.2f" % (fa, fb, cov, spd, best, errs[1], errs[4]))
+    for fr, cov, mx in resets:
+        print("%4d       reset (camera cut / no history): motion on %.1f%% of pixels, max %.2f px" % (fr, cov, mx))
     if rows:
+        rows = [r for r in rows if not np.all(np.isnan(r[4]))]
         print("best k=1 in %d of %d pairs; mean error still %.2f, motion %.2f" % (
             sum(1 for r in rows if ks[int(np.nanargmin(r[4]))] == 1), len(rows),
             np.nanmean([r[4][1] for r in rows]), np.nanmean([r[4][4] for r in rows])))

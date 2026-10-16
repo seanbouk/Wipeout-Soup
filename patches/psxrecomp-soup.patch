@@ -465,7 +465,7 @@ index 5417b288..08fb32de 100644
                    << " unsupported instructions; see unsupported_ops.json. "
                       "No C emitted.\n";
 diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
-index 83d53858..86c9c5df 100644
+index 83d53858..0e43c775 100644
 --- a/runtime/include/gpu_gl_renderer.h
 +++ b/runtime/include/gpu_gl_renderer.h
 @@ -138,6 +138,27 @@ int  gl_renderer_get_scanlines(float *strength);
@@ -488,7 +488,7 @@ index 83d53858..86c9c5df 100644
 +int  gl_renderer_get_motion_output(void);
 +/* Debug: write the next `count` presented frames' colour (RGBA8) and motion
 + * (RGBA float: xy = native-pixel motion, z = written flag) into dir as
-+ * fNNNN.rgba / fNNNN.mv / fNNNN.txt ("w h scale game_frame"). Rows are in
++ * fNNNN.rgba / fNNNN.mv / fNNNN.txt ("w h scale render reset"). Rows are in
 + * render-target order (VRAM y ascending). */
 +void gl_renderer_mv_capture(const char *dir, int count);
 +int  gl_renderer_mv_capture_left(void);
@@ -527,10 +527,10 @@ index ace31f11..87d52103 100644
      void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,
 diff --git a/runtime/include/motion_vectors.h b/runtime/include/motion_vectors.h
 new file mode 100644
-index 00000000..04df1d23
+index 00000000..9c4cdcb1
 --- /dev/null
 +++ b/runtime/include/motion_vectors.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,42 @@
 +/* Motion vectors (presentation only): previous-game-frame screen positions
 + * for projected vertices, from the game's camera. Implemented in gte.cpp;
 + * the GL renderer turns them into a per-pixel motion target. See
@@ -559,6 +559,10 @@ index 00000000..04df1d23
 +/* Render boundary (gpu.c calls this when the display buffer flips): the camera
 + * latched at this render's first projection becomes the previous camera. */
 +void psx_mv_render_boundary(void);
++/* 1 when the most recently completed render has no valid motion history:
++ * a camera cut, the first 3D after menus/FMV, or motion just enabled.
++ * (DLSS-style "reset" for the frame on screen.) */
++int psx_mv_last_render_was_reset(void);
 +/* Renders seen by psx_mv_render_boundary that had 3D. */
 +unsigned long long psx_mv_frame_count(void);
 +/* Debug: comma-separated JSON fields (no braces). */
@@ -778,7 +782,7 @@ index 41490964..db025627 100644
  
  static void gp1_h_display_range(uint32_t val) {
 diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
-index 2bb0e9f6..4e1f5f77 100644
+index 2bb0e9f6..096d6992 100644
 --- a/runtime/src/gpu_gl_renderer.c
 +++ b/runtime/src/gpu_gl_renderer.c
 @@ -113,6 +113,9 @@
@@ -1458,7 +1462,7 @@ index 2bb0e9f6..4e1f5f77 100644
              present_shot_done(wrote);
          }
      }
-@@ -4240,6 +4480,85 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+@@ -4240,6 +4480,87 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
      p_glUseProgram(0);
  }
  
@@ -1510,6 +1514,7 @@ index 2bb0e9f6..4e1f5f77 100644
 +int gl_renderer_mv_capture_left(void) { return s_mvcap_left; }
 +static void mv_capture_frame(GLuint fbo, int x, int y, int w, int h) {
 +    extern unsigned long long psx_mv_frame_count(void);
++    extern int psx_mv_last_render_was_reset(void);
 +    if (s_mvcap_left <= 0 || !s_mv_out || w <= 0 || h <= 0) return;
 +    const int S = s_scale, W = w * S, H = h * S;
 +    uint8_t *rgba = (uint8_t *)malloc((size_t)W * H * 4);
@@ -1531,7 +1536,8 @@ index 2bb0e9f6..4e1f5f77 100644
 +        if ((f = fopen(path, "wb"))) { fwrite(mv, 4 * sizeof(float), (size_t)W * H, f); fclose(f); }
 +        snprintf(path, sizeof path, "%s/f%04d.txt", s_mvcap_dir, s_mvcap_seq);
 +        if ((f = fopen(path, "w"))) {
-+            fprintf(f, "%d %d %d %llu\n", W, H, S, psx_mv_frame_count());
++            fprintf(f, "%d %d %d %llu %d\n", W, H, S, psx_mv_frame_count(),
++                    psx_mv_last_render_was_reset());
 +            fclose(f);
 +        }
 +    }
@@ -1544,7 +1550,7 @@ index 2bb0e9f6..4e1f5f77 100644
  /* Bezel art: a still image behind the frame, filling whatever the letterbox or
   * pillarbox leaves over. It never samples the frame, so unlike an edge-stretch
   * backdrop it is independent of what the game is currently drawing. */
-@@ -4397,6 +4716,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+@@ -4397,6 +4718,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
      present_bezel(ww, wh, lx, ly, lw, lh);
      present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                          disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
@@ -1553,7 +1559,7 @@ index 2bb0e9f6..4e1f5f77 100644
      pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4439,7 +4760,22 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
+@@ -4439,7 +4762,22 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
                          (base_x + native_w) * S, VRAM_H * S,
                          g_wide_off * S, 0,
                          (g_wide_off + native_w) * S, VRAM_H * S,
@@ -1577,7 +1583,7 @@ index 2bb0e9f6..4e1f5f77 100644
      p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
      p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
  }
-@@ -4501,6 +4837,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+@@ -4501,6 +4839,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
      }
      present_target_quad(tex, g_wide_w, VRAM_H,
                          0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1);
@@ -1586,7 +1592,7 @@ index 2bb0e9f6..4e1f5f77 100644
      pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4524,6 +4862,8 @@ static const GpuRenderBackend GL_BACKEND = {
+@@ -4524,6 +4864,8 @@ static const GpuRenderBackend GL_BACKEND = {
      .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
      .set_precise_triangle = glb_set_precise_triangle,
      .set_perspective_triangle = glb_set_perspective_triangle,
@@ -1615,10 +1621,10 @@ index c833f491..572b73cd 100644
  void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
  void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
 diff --git a/runtime/src/gte.cpp b/runtime/src/gte.cpp
-index 211007b9..36a29041 100644
+index 211007b9..62e46102 100644
 --- a/runtime/src/gte.cpp
 +++ b/runtime/src/gte.cpp
-@@ -2,6 +2,8 @@
+@@ -2,10 +2,13 @@
  #include "cpu_state.h"
  #include "nd_intro_ot.h"
  #include "pgxp.h"
@@ -1627,7 +1633,12 @@ index 211007b9..36a29041 100644
  #include <algorithm>
  #include <cstdlib>
  #include <cstdio>
-@@ -748,7 +750,8 @@ extern "C" int gte_latch_dump_json(char* out, int outsz, int max_count) {
+ #include <cstring>
++#include <cmath>
+ 
+ extern "C" uint32_t psx_read_word(uint32_t addr);
+ extern "C" int gpu_ws_precise_nclip_enabled(void);
+@@ -748,7 +751,8 @@ extern "C" int gte_latch_dump_json(char* out, int outsz, int max_count) {
  /* Format up to max_count recent entries as a JSON array body (no outer braces).
   * If frame_filter >= 0, only entries with that frame are emitted. Returns count. */
  extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
@@ -1637,7 +1648,7 @@ index 211007b9..36a29041 100644
      if (!s_gte_rtp_ring || outsz < 64) { if (out && outsz) out[0]=0; return 0; }
      uint64_t total = s_gte_rtp_seq;
      if (total == 0) { out[0]=0; return 0; }
-@@ -759,6 +762,7 @@ extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
+@@ -759,6 +763,7 @@ extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
          if (seq < oldest || seq >= total) break;
          const GteRtpRec* e = &s_gte_rtp_ring[seq % GTE_RTP_RING_CAP];
          if (frame_filter >= 0 && e->frame != (uint32_t)frame_filter) continue;
@@ -1645,7 +1656,7 @@ index 211007b9..36a29041 100644
          auto sxx = [](int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x10000:v; };
          auto syy = [](int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; };
          if (pos > outsz - 700) break;
-@@ -791,6 +795,188 @@ extern "C" void gte_set_display_aspect(int num, int den) {
+@@ -791,6 +796,253 @@ extern "C" void gte_set_display_aspect(int num, int den) {
      s_ws_xden = d / a;
  }
  
@@ -1673,7 +1684,7 @@ index 211007b9..36a29041 100644
 +static MvCamera s_mv_latch;               /* camera of the current render   */
 +static int      s_mv_latched = 0;
 +static struct { uint64_t frames, proj, static_proj, produced, behind,
-+                 object_proj, object_hit, object_new, table_full; } s_mv_stats;
++                 object_proj, object_hit, object_new, table_full, cuts, no3d; } s_mv_stats;
 +
 +/* Per-object transforms for moving things (psx_mv_object). Two small
 + * open-addressed tables, this render's and the previous render's, keyed by
@@ -1704,11 +1715,25 @@ index 211007b9..36a29041 100644
 +    return nullptr;
 +}
 +extern "C" void psx_mv_object(uint32_t key) { s_mv_obj = key; s_mv_obj_nmat = 0; }
-+/* Timing diagnostic: per game frame, the offset at frame end and the offsets
-+ * live at its first and last static projection (debug server mv_stats). */
-+struct MvFrameRec { int32_t end_off[3], first_off[3], last_off[3]; uint32_t nproj; };
-+static MvFrameRec s_mv_hist[8];
-+static MvFrameRec s_mv_cur_rec;
++/* Camera cuts. A render whose camera jumped further than any camera moves in
++ * one frame (a cut to another view, a restart, a replay angle) has no
++ * meaningful previous frame: its motion is suppressed and it is flagged as a
++ * history reset (what DLSS calls "reset"). Renders without 3D (menus, FMV,
++ * loading) also break the history. Thresholds: a chase camera at top speed
++ * moves a few hundred units a frame; cuts jump thousands, or turn the view. */
++#define MV_CUT_MOVE   1536.0     /* camera position change, world units        */
++#define MV_CUT_TURN   1024       /* largest rotation element change (/4096)    */
++static int      s_mv_cut = 0;            /* this render is a reset           */
++/* Reset status of the frame on screen. A render reaches the screen one flip
++ * after the flip that completes it (measured: the frame displayed after a cut
++ * is the one with no motion), so each render's status waits one flip. */
++static int      s_mv_pending_reset = 1;  /* the render just completed        */
++static int      s_mv_last_reset = 1;     /* the render now on screen          */
++/* Per-render camera jump history for tuning (debug server mv_stats). */
++struct MvJump { float move; int16_t turn; uint8_t cut; uint8_t no3d; };
++static MvJump   s_mv_jumps[32];
++static uint32_t s_mv_jump_n = 0;
++static MvJump   s_mv_jump_cur;
 +
 +static void mv_read_camera(MvCamera* c) {
 +    for (int i = 0; i < 9; i++) c->r[i] = (int16_t)psx_mod_read_half(s_mv_rot_addr + i * 2);
@@ -1721,57 +1746,73 @@ index 211007b9..36a29041 100644
 +    s_mv_off_addr = off_addr;
 +}
 +extern "C" void psx_mv_render_boundary(void) {
-+    if (!s_mv_on || !s_mv_rot_addr || !s_mv_latched) return;   /* no 3D this render */
++    if (!s_mv_on || !s_mv_rot_addr) return;
++    if (!s_mv_latched) {                     /* no 3D this render: history breaks */
++        if (s_mv_have_prev) {
++            s_mv_stats.no3d++;
++            MvJump j = {}; j.no3d = 1;
++            s_mv_jumps[s_mv_jump_n++ % 32] = j;
++        }
++        s_mv_have_prev = 0;
++        s_mv_last_reset = s_mv_pending_reset;
++        s_mv_pending_reset = 1;
++        memset(s_mv_obj_tab, 0, sizeof s_mv_obj_tab);
++        s_mv_obj = 0;
++        return;
++    }
++    s_mv_last_reset = s_mv_pending_reset;
++    s_mv_pending_reset = s_mv_cut || !s_mv_have_prev;
++    s_mv_jumps[s_mv_jump_n++ % 32] = s_mv_jump_cur;
 +    s_mv_prev = s_mv_latch;
 +    s_mv_have_prev = 1;
 +    s_mv_latched = 0;
++    s_mv_cut = 0;
 +    s_mv_obj_cur ^= 1;                                       /* objects: cur -> prev */
 +    memset(s_mv_obj_tab[s_mv_obj_cur], 0, sizeof s_mv_obj_tab[s_mv_obj_cur]);
 +    s_mv_obj = 0;
-+    MvCamera now;
-+    mv_read_camera(&now);
-+    for (int i = 0; i < 3; i++) s_mv_cur_rec.end_off[i] = now.off[i];
-+    s_mv_hist[s_mv_stats.frames % 8] = s_mv_cur_rec;
-+    memset(&s_mv_cur_rec, 0, sizeof s_mv_cur_rec);
-+    s_mv_have_prev = 1;
 +    s_mv_stats.frames++;
 +}
++extern "C" int psx_mv_last_render_was_reset(void) { return s_mv_last_reset; }
 +extern "C" unsigned long long psx_mv_frame_count(void) { return s_mv_stats.frames; }
 +extern "C" int psx_mv_stats_json(char* out, int n) {
 +    int k = 0;
-+    k += snprintf(out + k, n - k, "\"hist\":[");
-+    for (int j = 0; j < 8 && k < n; j++) {
-+        const MvFrameRec* h = &s_mv_hist[(s_mv_stats.frames + j) % 8];
-+        k += snprintf(out + k, n - k, "%s{\"n\":%u,\"first\":[%d,%d,%d],\"last\":[%d,%d,%d],\"end\":[%d,%d,%d]}",
-+                      j ? "," : "", h->nproj, h->first_off[0], h->first_off[1], h->first_off[2],
-+                      h->last_off[0], h->last_off[1], h->last_off[2],
-+                      h->end_off[0], h->end_off[1], h->end_off[2]);
++    k += snprintf(out + k, n - k, "\"jumps\":[");
++    for (uint32_t j = 0; j < 32 && k < n; j++) {
++        if (s_mv_jump_n < 32 && j >= s_mv_jump_n) break;
++        const MvJump* m = &s_mv_jumps[s_mv_jump_n < 32 ? j : (s_mv_jump_n + j) % 32];
++        k += snprintf(out + k, n - k, "%s[%.0f,%d,%d,%d]", j ? "," : "",
++                      (double)m->move, m->turn, m->cut, m->no3d);
 +    }
-+    k += snprintf(out + k, n - k, "],");
++    k += snprintf(out + k, n - k, "],\"last_reset\":%d,", s_mv_last_reset);
 +    return k + snprintf(out + k, n - k, "\"on\":%d,\"rot\":\"0x%08X\",\"off\":\"0x%08X\",\"have_prev\":%d,"
 +                    "\"frames\":%llu,\"projections\":%llu,\"static\":%llu,\"produced\":%llu,\"behind\":%llu,"
-+                    "\"object_proj\":%llu,\"object_hit\":%llu,\"object_new\":%llu,\"table_full\":%llu",
++                    "\"object_proj\":%llu,\"object_hit\":%llu,\"object_new\":%llu,\"table_full\":%llu,"
++                    "\"cuts\":%llu,\"no3d\":%llu",
 +                    s_mv_on, s_mv_rot_addr, s_mv_off_addr, s_mv_have_prev,
 +                    (unsigned long long)s_mv_stats.frames, (unsigned long long)s_mv_stats.proj,
 +                    (unsigned long long)s_mv_stats.static_proj, (unsigned long long)s_mv_stats.produced,
 +                    (unsigned long long)s_mv_stats.behind,
 +                    (unsigned long long)s_mv_stats.object_proj, (unsigned long long)s_mv_stats.object_hit,
-+                    (unsigned long long)s_mv_stats.object_new, (unsigned long long)s_mv_stats.table_full);
++                    (unsigned long long)s_mv_stats.object_new, (unsigned long long)s_mv_stats.table_full,
++                    (unsigned long long)s_mv_stats.cuts, (unsigned long long)s_mv_stats.no3d);
 +}
-+/* Project a previous-render view position and attach the motion delta. */
-+static void mv_emit(const GTEState* gte, const double vp[3], double xk, int64_t sx16, int64_t sy16) {
-+    if (vp[2] < 1.0) { s_mv_stats.behind++; return; }
++/* Attach the motion delta between a vertex's current and previous-render view
++ * positions. Both are projected by the same exact formula, so the GTE's
++ * approximate (reciprocal-table) divide never biases the result: a static
++ * scene under a static camera gives exactly zero. */
++static void mv_emit(const GTEState* gte, const double vc[3], const double vp[3], double xk) {
++    if (vp[2] < 1.0 || vc[2] < 1.0) { s_mv_stats.behind++; return; }
++    const double k = gte->H * 65536.0;
++    const double dx = xk * k * (vc[0] / vc[2] - vp[0] / vp[2]);
++    const double dy = k * (vc[1] / vc[2] - vp[1] / vp[2]);
 +    const double lim = 4096.0 * 65536.0;
-+    double px = gte->OFX + xk * gte->H * vp[0] / vp[2] * 65536.0;
-+    double py = gte->OFY + gte->H * vp[1] / vp[2] * 65536.0;
-+    if (px < -lim || px >= lim || py < -lim || py >= lim) return;
-+    pgxp_gte_set_motion((int32_t)((double)sx16 - px), (int32_t)((double)sy16 - py));
++    if (dx < -lim || dx >= lim || dy < -lim || dy >= lim) return;
++    pgxp_gte_set_motion((int32_t)dx, (int32_t)dy);
 +    s_mv_stats.produced++;
 +}
 +
 +/* A moving object's vertex: same model-space V, the object's previous RT/TR. */
-+static void mv_object_prev(const GTEState* gte, const int16_t* V, double xk,
-+                           int64_t sx16, int64_t sy16) {
++static void mv_object_prev(const GTEState* gte, const int16_t* V, const double vc[3], double xk) {
 +    s_mv_stats.object_proj++;
 +    int16_t rt[9]; int32_t tr[3];
 +    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) rt[r * 3 + c] = gte->RT[r][c];
@@ -1796,45 +1837,80 @@ index 211007b9..36a29041 100644
 +    for (int i = 0; i < 3; i++)
 +        vp[i] = prev->tr[i] + (prev->rt[i * 3] * (double)V[0] + prev->rt[i * 3 + 1] * (double)V[1] +
 +                               prev->rt[i * 3 + 2] * (double)V[2]) / 4096.0;
-+    mv_emit(gte, vp, xk, sx16, sy16);
++    mv_emit(gte, vc, vp, xk);
 +}
 +
 +static void mv_project_prev(const GTEState* gte, const int16_t* V, int64_t mac1, int64_t mac2,
-+                            int64_t mac3, double xk, int64_t sx16, int64_t sy16) {
++                            int64_t mac3, double xk) {
 +    s_mv_stats.proj++;
++    const double view[3] = { mac1 / 4096.0, mac2 / 4096.0, mac3 / 4096.0 };
 +    MvCamera cur;
 +    mv_read_camera(&cur);
 +    for (int r = 0; r < 3; r++)
 +        for (int c = 0; c < 3; c++)
 +            if (gte->RT[r][c] != cur.r[r * 3 + c]) {         /* not static world */
-+                if (s_mv_obj && s_mv_have_prev) mv_object_prev(gte, V, xk, sx16, sy16);
++                if (s_mv_obj && s_mv_have_prev && !s_mv_cut) mv_object_prev(gte, V, view, xk);
 +                return;
 +            }
 +    s_mv_stats.static_proj++;
-+    if (!s_mv_latched) { s_mv_latch = cur; s_mv_latched = 1; }
-+    if (!s_mv_have_prev) return;
-+    if (s_mv_cur_rec.nproj++ == 0)
-+        for (int i = 0; i < 3; i++) s_mv_cur_rec.first_off[i] = cur.off[i];
-+    for (int i = 0; i < 3; i++) s_mv_cur_rec.last_off[i] = cur.off[i];
-+    const double view[3] = { mac1 / 4096.0, mac2 / 4096.0, mac3 / 4096.0 };
-+    double w[3], vp[3];
-+    for (int i = 0; i < 3; i++) {
-+        double a = 0;
-+        for (int k = 0; k < 3; k++) a += cur.r[k * 3 + i] * view[k];
-+        w[i] = a / 4096.0 - cur.off[i] + s_mv_prev.off[i];
++    if (!s_mv_latched) {
++        s_mv_latch = cur;
++        s_mv_latched = 1;
++        s_mv_jump_cur = MvJump{};
++        if (s_mv_have_prev) {
++            double m = 0;
++            for (int i = 0; i < 3; i++) {
++                double d = (double)cur.off[i] - s_mv_prev.off[i];
++                m += d * d;
++            }
++            int turn = 0;
++            for (int i = 0; i < 9; i++) {
++                int d = cur.r[i] - s_mv_prev.r[i];
++                if (d < 0) d = -d;
++                if (d > turn) turn = d;
++            }
++            s_mv_jump_cur.move = (float)std::sqrt(m);
++            s_mv_jump_cur.turn = (int16_t)turn;
++            s_mv_cut = (s_mv_jump_cur.move > MV_CUT_MOVE || turn > MV_CUT_TURN);
++            s_mv_jump_cur.cut = (uint8_t)s_mv_cut;
++            if (s_mv_cut) s_mv_stats.cuts++;
++        }
 +    }
++    if (!s_mv_have_prev || s_mv_cut) return;
++    /* W + off = R^-1 * view. The exact inverse, not the transpose: the game's
++     * integer rotation is only nearly orthonormal, and the transpose's error
++     * shows up as motion on a camera that hasn't moved. Cached per rotation. */
++    static int16_t inv_of[9] = { 0 };
++    static double  inv[9];
++    if (memcmp(inv_of, cur.r, sizeof inv_of)) {
++        double m[9];
++        for (int i = 0; i < 9; i++) m[i] = cur.r[i] / 4096.0;
++        const double c0 = m[4] * m[8] - m[5] * m[7], c1 = m[5] * m[6] - m[3] * m[8],
++                     c2 = m[3] * m[7] - m[4] * m[6];
++        const double det = m[0] * c0 + m[1] * c1 + m[2] * c2;
++        if (det > -1e-9 && det < 1e-9) return;
++        const double id = 1.0 / det;
++        inv[0] = c0 * id; inv[1] = (m[2] * m[7] - m[1] * m[8]) * id; inv[2] = (m[1] * m[5] - m[2] * m[4]) * id;
++        inv[3] = c1 * id; inv[4] = (m[0] * m[8] - m[2] * m[6]) * id; inv[5] = (m[2] * m[3] - m[0] * m[5]) * id;
++        inv[6] = c2 * id; inv[7] = (m[1] * m[6] - m[0] * m[7]) * id; inv[8] = (m[0] * m[4] - m[1] * m[3]) * id;
++        memcpy(inv_of, cur.r, sizeof inv_of);
++    }
++    double w[3], vp[3];
++    for (int i = 0; i < 3; i++)
++        w[i] = inv[i * 3] * view[0] + inv[i * 3 + 1] * view[1] + inv[i * 3 + 2] * view[2]
++             - cur.off[i] + s_mv_prev.off[i];
 +    for (int i = 0; i < 3; i++) {
 +        double a = 0;
 +        for (int k = 0; k < 3; k++) a += s_mv_prev.r[i * 3 + k] * w[k];
 +        vp[i] = a / 4096.0;
 +    }
-+    mv_emit(gte, vp, xk, sx16, sy16);
++    mv_emit(gte, view, vp, xk);
 +}
 +
  // ---------------------------------------------------------------------------
  // RTPS — Perspective Transformation (internal, operates on given vertex V)
  //
-@@ -869,8 +1055,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+@@ -869,8 +1121,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
              if (!s_gte_replay_sandbox) s_ws_sz_far++;
          }
      }
@@ -1847,7 +1923,7 @@ index 211007b9..36a29041 100644
      // Native-wide dome expansion remains a diagnostic-only depth probe.
      else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
               !gpu_ws_present_native_43()) {
-@@ -882,6 +1071,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+@@ -882,6 +1137,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
          }
          if (sz >= s_ws_far_threshold) {
              xterm = xterm * s_ws_dome_num / s_ws_dome_den;
@@ -1855,12 +1931,12 @@ index 211007b9..36a29041 100644
              if (!s_gte_replay_sandbox) s_ws_sz_far++;
          }
      }
-@@ -899,6 +1089,8 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+@@ -899,6 +1155,8 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
          int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
          pgxp_gte_push_sxy((int32_t)cx16, (int32_t)cy16, gte->SZ[3],
                            (uint32_t)gte->SXY[2]);
 +        if (s_mv_on && s_mv_rot_addr)
-+            mv_project_prev(gte, V, mac1, mac2, mac3, mv_xk, sx16, sy16);
++            mv_project_prev(gte, V, mac1, mac2, mac3, mv_xk);
      }
      geom_note((uint32_t)gte->SXY[2], sx16, sy16);
  
