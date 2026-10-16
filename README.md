@@ -2,10 +2,16 @@
 
 > **Fork of [NJH-1001/Wipeout2K97XL](https://github.com/NJH-1001/Wipeout2K97XL).**
 > All credit for the recompilation project goes to its author. This fork adds
-> experiments on top: ultrawide aspect choices in the widescreen mod, plus
-> `patches/psxrecomp-soup.patch`, which carries framework fixes that let the
-> retail SCPH-1001 BIOS boot (see
-> [docs/upstream/psxrecomp-scph1001-issue.md](docs/upstream/psxrecomp-scph1001-issue.md)).
+> experiments on top:
+> - ultrawide aspect choices in the widescreen mod;
+> - a **Scene Depth (ReShade)** mod that gives the game a real depth buffer
+>   for ReShade, built on a full-PGXP build of the game. See
+>   [docs/soup/scene-depth-reshade.md](docs/soup/scene-depth-reshade.md);
+> - framework fixes that let the retail SCPH-1001 BIOS boot (see
+>   [docs/upstream/psxrecomp-scph1001-issue.md](docs/upstream/psxrecomp-scph1001-issue.md)).
+>
+> Framework changes live in `patches/psxrecomp-soup.patch`, applied after
+> upstream's `patches/psxrecomp.patch`.
 > The rest of this README is upstream's. Report problems with the fork's
 > changes here, not upstream.
 

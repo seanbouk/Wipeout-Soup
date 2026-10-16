@@ -1,0 +1,22 @@
+format_version = 5
+id = "soup.presentation.scene-depth"
+version = "1.0.0"
+name = "Scene Depth (ReShade)"
+author = "Wipeout Soup"
+description = "Gives the game a real depth buffer for post-process tools such as ReShade (depth of field, ambient occlusion, motion vectors). OpenGL only."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SCUS-94351"
+
+[[feature]]
+id = "scene-depth"
+name = "Scene Depth (ReShade)"
+description = "Writes each 3D polygon's distance into the window's depth buffer, where ReShade's depth-based effects read it. Needs PGXP Precision enabled. Depth starts as a far/near curve from 1 to 65536, so set ReShade's far plane high. 2D sprites, HUD and text carry no depth. No visible change on its own."
+group = "Visual"
+default_enabled = false
+
+[[plugin]]
+feature = "scene-depth"
+id = "soup.scene-depth"

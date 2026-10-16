@@ -34,7 +34,18 @@ if(NOT IS_DIRECTORY "${PSX_PRELOADED_MODS}")
     set(PSX_PRELOADED_MODS "NONE")
 endif()
 
+# Wipeout Soup: compile the game with the PGXP hooks (-DPSX_PGXP=1). The base
+# build only catches ~10% of vertices for PGXP; this one tracks nearly all of
+# them, which Scene Depth needs and the PGXP Precision mod benefits from.
+# Measured at no frame-time cost. The PGXP mods stay opt-in either way.
+option(SOUP_FULL_PGXP "Build the game with full PGXP coverage" ON)
+set(_soup_pgxp_arg)
+if(SOUP_FULL_PGXP)
+    set(_soup_pgxp_arg PGXP)
+endif()
+
 psxrecomp_add_game_runtime(psx-runtime
+    ${_soup_pgxp_arg}
     PRELOADED_MODS_DIR "${PSX_PRELOADED_MODS}"
     # ENABLE_NETPLAY_IF_PRESENT
     # NETPLAY_LOBBY_URL "ws://netplay.retcomm.net:8765"
@@ -74,8 +85,24 @@ target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/crt_mod.c")
 
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/widescreen_mod.c")
 
+# Wipeout Soup: scene depth for post-process tools (ReShade).
+target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/scene_depth_mod.c")
+
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/track_distance_experimental.c")
 
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/ship_distance_mod.c")
 
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/negcon_mod.c")
+
+# Wipeout Soup: -DPSX_PGXP_VARIANT=ON clones psx-runtime as psx-runtime-pgxp
+# (full PGXP coverage, which Scene Depth needs). Give it the same plugins, or it
+# refuses to launch with any of these mods selected.
+if(TARGET psx-runtime-pgxp)
+    target_sources(psx-runtime-pgxp PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/crt_mod.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/widescreen_mod.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/scene_depth_mod.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/track_distance_experimental.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ship_distance_mod.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/negcon_mod.c")
+endif()
