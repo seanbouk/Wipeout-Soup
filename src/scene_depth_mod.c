@@ -26,6 +26,17 @@ static void note_camera(CPUState *cpu, uint32_t address) {
     uint32_t root = psx_mod_read_word(node + 0x44);
     if (!in_ram(root, 0x48) || psx_mod_read_word(root + 0x44)) return;
     psx_mv_set_camera(root, node + 0x14);
+    psx_mv_object(0);                     /* track/scenery: camera-only motion */
+}
+
+/* Moving objects carry their own transform; tell the framework which one is
+ * being drawn so it can use that object's previous transform. Both renderers
+ * take the object's model in a0: 0x80011DE8 draws each near ship (called once
+ * per ship by the 0x80021B90 dispatcher, 15 ships = 15 models), 0x80010000 is
+ * the general model renderer (upstream's note_model reads the same a0). */
+static void note_object(CPUState *cpu, uint32_t address) {
+    (void)address;
+    psx_mv_object(cpu->gpr[4]);
 }
 
 static void activate_scene_depth(void) {
@@ -38,6 +49,8 @@ static void activate_scene_depth(void) {
         psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80013c78u, note_camera);
         psx_mod_register_function_entry_plugin("soup.scene-depth", 0x800140acu, note_camera);
         psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80014ad4u, note_camera);
+        psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80011de8u, note_object);
+        psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80010000u, note_object);
     }
 }
 PSX_MOD_CONSTRUCTOR(register_soup_scene_depth) {
