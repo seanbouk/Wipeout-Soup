@@ -17,6 +17,14 @@ description = "Writes each 3D polygon's distance into the window's depth buffer,
 group = "Visual"
 default_enabled = false
 
+[[option]]
+feature = "scene-depth"
+id = "motion"
+label = "Motion vectors (experimental)"
+description = "Also work out how far each 3D surface moved since the last frame, for future DLSS and motion effects. Track and scenery only so far: ships don't get motion yet. No visible change on its own."
+type = "boolean"
+default = "false"
+
 [[plugin]]
 feature = "scene-depth"
 id = "soup.scene-depth"

@@ -61,6 +61,12 @@ present triangle, and its depth arrives by blit. So the renderer issues one
 6-vertex draw with all writes masked off. It changes no pixel and no depth
 value; it just makes the window depth a detection candidate.
 
+## Motion vectors (experimental)
+
+The Scene Depth mod has a *Motion vectors* option: a per-pixel motion layer
+for the track and scenery, groundwork for DLSS. It isn't exposed to ReShade
+yet. See [motion-vectors-phase1.md](motion-vectors-phase1.md).
+
 ## Debug
 
 On a `-DPSX_DEBUG_TOOLS=ON` build, `{"cmd":"present_shot","path":"d.png","depth":1}`

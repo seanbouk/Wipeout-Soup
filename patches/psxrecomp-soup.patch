@@ -465,10 +465,10 @@ index 5417b288..08fb32de 100644
                    << " unsupported instructions; see unsupported_ops.json. "
                       "No C emitted.\n";
 diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
-index 83d53858..2b8506ca 100644
+index 83d53858..86c9c5df 100644
 --- a/runtime/include/gpu_gl_renderer.h
 +++ b/runtime/include/gpu_gl_renderer.h
-@@ -138,6 +138,15 @@ int  gl_renderer_get_scanlines(float *strength);
+@@ -138,6 +138,27 @@ int  gl_renderer_get_scanlines(float *strength);
   * path. Textured edge expansion needs the complete mirror surface. */
  void gl_renderer_set_wide_fast(int on);
  
@@ -481,14 +481,26 @@ index 83d53858..2b8506ca 100644
 +/* Make the next present_shot capture the depth view instead of colour. */
 +void gl_renderer_present_shot_depth(int on);
 +
++/* Motion vectors for the scene (motion_vectors.h supplies the per-vertex
++ * data). Set before the renderer initialises; allocates a motion attachment
++ * per render target. Presentation only. */
++void gl_renderer_set_motion_output(int on);
++int  gl_renderer_get_motion_output(void);
++/* Debug: write the next `count` presented frames' colour (RGBA8) and motion
++ * (RGBA float: xy = native-pixel motion, z = written flag) into dir as
++ * fNNNN.rgba / fNNNN.mv / fNNNN.txt ("w h scale game_frame"). Rows are in
++ * render-target order (VRAM y ascending). */
++void gl_renderer_mv_capture(const char *dir, int count);
++int  gl_renderer_mv_capture_left(void);
++
  void gl_renderer_shutdown(void);
  
  /* Diagnostics (debug server): read GPU-side VRAM without touching the CPU
 diff --git a/runtime/include/gpu_render.h b/runtime/include/gpu_render.h
-index ace31f11..6fcd74b4 100644
+index ace31f11..87d52103 100644
 --- a/runtime/include/gpu_render.h
 +++ b/runtime/include/gpu_render.h
-@@ -54,6 +54,11 @@ void gr_set_precise_triangle(int enabled,
+@@ -54,6 +54,15 @@ void gr_set_precise_triangle(int enabled,
   * perspective_texturing). q[i] is the normalized 1/z homogeneous weight at
   * vertex i. enabled == 0 restores the PS1's affine UV interpolation. */
  void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
@@ -497,19 +509,89 @@ index ace31f11..6fcd74b4 100644
 + * that post-process tools (ReShade, motion estimation) read; it never changes
 + * draw order or what the game sees. valid == 0 means "no depth for this prim". */
 +void gr_set_triangle_depth(int valid, uint16_t z0, uint16_t z1, uint16_t z2);
++/* Motion of each vertex of the NEXT triangle since the previous game frame:
++ * current minus previous screen position, 16.16 native pixels (motion
++ * vectors). valid == 0 means no motion for this prim. Presentation only. */
++void gr_set_triangle_motion(int valid, const int32_t dx16[3], const int32_t dy16[3]);
  
  /* Primitives */
  void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
-@@ -142,6 +147,7 @@ typedef struct GpuRenderBackend {
+@@ -142,6 +151,8 @@ typedef struct GpuRenderBackend {
                                   int32_t x1, int32_t y1,
                                   int32_t x2, int32_t y2);
      void (*set_perspective_triangle)(int enabled, float q0, float q1, float q2);
 +    void (*set_triangle_depth)(int valid, uint16_t z0, uint16_t z1, uint16_t z2);
++    void (*set_triangle_motion)(int valid, const int32_t dx16[3], const int32_t dy16[3]);
      void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
      void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
      void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,
+diff --git a/runtime/include/motion_vectors.h b/runtime/include/motion_vectors.h
+new file mode 100644
+index 00000000..d567aa33
+--- /dev/null
++++ b/runtime/include/motion_vectors.h
+@@ -0,0 +1,32 @@
++/* Motion vectors (presentation only): previous-game-frame screen positions
++ * for projected vertices, from the game's camera. Implemented in gte.cpp;
++ * the GL renderer turns them into a per-pixel motion target. See
++ * gl_renderer_set_motion_output (gpu_gl_renderer.h). */
++#ifndef PSX_MOTION_VECTORS_H
++#define PSX_MOTION_VECTORS_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Arm or disarm motion production (clears the camera history). */
++void psx_mv_enable(int on);
++/* Where the game's camera lives in guest RAM: rot_addr -> 3x3 int16 rotation
++ * (the GTE RT used for static world geometry), off_addr -> int32[3] offset
++ * added to world points before rotation (= -camera position). */
++void psx_mv_set_camera(uint32_t rot_addr, uint32_t off_addr);
++/* Render boundary (gpu.c calls this when the display buffer flips): the camera
++ * latched at this render's first projection becomes the previous camera. */
++void psx_mv_render_boundary(void);
++/* Renders seen by psx_mv_render_boundary that had 3D. */
++unsigned long long psx_mv_frame_count(void);
++/* Debug: comma-separated JSON fields (no braces). */
++int psx_mv_stats_json(char *out, int n);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/runtime/include/pgxp.h b/runtime/include/pgxp.h
+index aa55b3aa..662a2906 100644
+--- a/runtime/include/pgxp.h
++++ b/runtime/include/pgxp.h
+@@ -54,6 +54,11 @@ void pgxp_suppress_end(void);
+  * coordinates, the projected depth (SZ3), and the packed SXY word the guest
+  * sees. Shifts the shadow FIFO exactly like push_sxy (regs 12..15). */
+ void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3, uint32_t packed);
++/* Attach a motion delta (this projection's 16.16 screen position minus the
++ * previous game frame's) to the value just pushed (motion vectors, gte.cpp
++ * psx_mv_*). A delta, not a position, so offsets the game adds to screen
++ * coordinates after projection cancel out. Presentation only. */
++void pgxp_gte_set_motion(int32_t mx16, int32_t my16);
+ 
+ /* Current SXY FIFO shadow (index 0..3 selects GTE data regs 12..15).
+  * Returns nonzero when the shadow is live and carries X/Y precision. */
+@@ -89,6 +94,10 @@ enum {
+ int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                             int32_t int_x, int32_t int_y,
+                             int32_t *x16, int32_t *y16, uint16_t *sz);
++/* Motion delta (16.16, current minus previous screen position) for a GP0
++ * vertex word, if its dataflow shadow carries one and still matches. */
++int pgxp_get_motion_vertex(uint32_t addr, uint32_t packet_word,
++                           int32_t *mx16, int32_t *my16);
+ 
+ /* --- observability -------------------------------------------------------- */
+ 
 diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
-index 1c7bcd72..cce87008 100644
+index 1c7bcd72..e2df734c 100644
 --- a/runtime/src/debug_server.c
 +++ b/runtime/src/debug_server.c
 @@ -6301,18 +6301,21 @@ static void handle_gte_ring_dump(int id, const char *json)
@@ -547,27 +629,86 @@ index 1c7bcd72..cce87008 100644
      if (!present_shot_request(path)) {
          send_err(id, "present_shot unavailable (headless, or the Vulkan backend "
                       "which has no present readback)");
+@@ -8991,6 +8998,32 @@ static void handle_present_shot(int id, const char *json)
+              id, path, present_shot_seq());
+ }
+ 
++/* mv_stats — motion-vector producer counters (gte.cpp) and renderer state.
++ * mv_capture {"dir":D,"count":N} — dump the next N presented frames' colour
++ * and motion to D (see gl_renderer_mv_capture); poll mv_stats "capture_left". */
++static void handle_mv_stats(int id, const char *json)
++{
++    extern int psx_mv_stats_json(char *out, int n);
++    extern int gl_renderer_get_motion_output(void);
++    extern int gl_renderer_mv_capture_left(void);
++    extern int gpu_mv_stats_json(char *out, int n);
++    char body[2048], gpu[256];
++    (void)json;
++    psx_mv_stats_json(body, (int)sizeof body);
++    gpu_mv_stats_json(gpu, (int)sizeof gpu);
++    send_fmt("{\"id\":%d,\"ok\":true,%s,%s,\"renderer\":%d,\"capture_left\":%d}",
++             id, body, gpu, gl_renderer_get_motion_output(), gl_renderer_mv_capture_left());
++}
++static void handle_mv_capture(int id, const char *json)
++{
++    extern void gl_renderer_mv_capture(const char *dir, int count);
++    char dir[400];
++    if (!json_get_str(json, "dir", dir, sizeof(dir))) { send_err(id, "missing dir"); return; }
++    int count = json_get_int(json, "count", 1);
++    gl_renderer_mv_capture(dir, count);
++    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d}", id, count);
++}
++
+ /* present_shot_seq — completion counter for the staged capture above. Sample it
+  * before present_shot and poll until it changes; the counter advances on every
+  * completion, success or not, so the poll always terminates. `wrote` reports
+@@ -13887,6 +13920,8 @@ static const CmdEntry s_commands[] = {
+     { "screenshot_file",   handle_screenshot_file },
+     { "screenshot_hires",  handle_screenshot_hires },
+     { "present_shot",      handle_present_shot },
++    { "mv_stats",          handle_mv_stats },
++    { "mv_capture",        handle_mv_capture },
+     { "present_shot_seq",  handle_present_shot_seq },
+     { "display_ring_get",  handle_display_ring_get },
+     { "display_ring_aux",  handle_display_ring_aux },
 diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
-index 41490964..36c32c0b 100644
+index 41490964..db025627 100644
 --- a/runtime/src/gpu.c
 +++ b/runtime/src/gpu.c
-@@ -3396,6 +3396,7 @@ uint32_t gpu_texture_correction_hits(void) {
+@@ -3393,9 +3393,22 @@ uint32_t gpu_texture_correction_hits(void) {
+  * it, so shared edges between neighbouring triangles cannot disagree by more
+  * than the sub-pixel fraction. The integer delta folds in draw offsets and
+  * any widescreen adjustment already applied by the caller. */
++/* Motion-vector plumbing counters (debug server "mv_stats"). */
++static struct { uint64_t tris, precise_tris, motion_tris, vtx_precise, vtx_motion; } s_mvgpu;
++int gpu_mv_stats_json(char *out, int n) {
++    return snprintf(out, n, "\"gpu_tris\":%llu,\"gpu_precise_tris\":%llu,\"gpu_motion_tris\":%llu,"
++                    "\"gpu_vtx_precise\":%llu,\"gpu_vtx_motion\":%llu",
++                    (unsigned long long)s_mvgpu.tris, (unsigned long long)s_mvgpu.precise_tris,
++                    (unsigned long long)s_mvgpu.motion_tris, (unsigned long long)s_mvgpu.vtx_precise,
++                    (unsigned long long)s_mvgpu.vtx_motion);
++}
++
  static void prepare_precise_triangle(int i0, int i1, int i2,
                                       const int32_t vx[3], const int32_t vy[3]) {
      gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
 +    gr_set_triangle_depth(0, 0, 0, 0);
++    gr_set_triangle_motion(0, NULL, NULL);
++    s_mvgpu.tris++;
      if (!gte_geometry_correction_enabled() &&
          !psx_mod_gpu_dma_aperture_offset_for(gp0_cmd_source_addr,4,PSX_MOD_GPU_DMA_APERTURE_SIZE,NULL)) {
          gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
-@@ -3403,6 +3404,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+@@ -3403,6 +3416,9 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
      }
      const int idx[3] = { i0, i1, i2 };
      int32_t fx[3], fy[3];
 +    uint16_t vz[3] = { 0, 0, 0 };
++    int32_t mx[3], my[3];
++    int n_motion = 0;
      int any_precise = 0;
      for (int i = 0; i < 3; i++) {
          uint32_t word = gp0_cmd_buf[idx[i]];
-@@ -3412,13 +3414,15 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+@@ -3412,21 +3428,35 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
                              ? 0xFFFFFFFFu
                              : gp0_cmd_source_addr + (uint32_t)idx[i] * 4u;
          int32_t px=raw_x*65536, py=raw_y*65536;
@@ -581,20 +722,31 @@ index 41490964..36c32c0b 100644
 +                                        &px, &py, &sz) != PGXP_SRC_NATIVE) {
              any_precise = 1;
 +            vz[i] = sz;
++            s_mvgpu.vtx_precise++;
++        }
++        if (pgxp_get_motion_vertex(addr, word, &mx[i], &my[i])) {
++            s_mvgpu.vtx_motion++;
++            n_motion++;
 +        }
          fx[i] = (int32_t)((int64_t)px + (int64_t)(vx[i] - raw_x) * 65536);
          fy[i] = (int32_t)((int64_t)py + (int64_t)(vy[i] - raw_y) * 65536);
      }
-@@ -3427,6 +3431,8 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
++    if (n_motion == 3) {
++        gr_set_triangle_motion(1, mx, my);
++        s_mvgpu.motion_tris++;
++    }
+     if (!any_precise) {
+         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
          return;
      }
      gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
 +    if (vz[0] && vz[1] && vz[2])
 +        gr_set_triangle_depth(1, vz[0], vz[1], vz[2]);
++    s_mvgpu.precise_tris++;
  }
  
  /* Arming rate for perspective-correct UVs, per condition.
-@@ -3481,6 +3487,8 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
+@@ -3481,6 +3511,8 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
      if (qmax <= 0.0f) { s_texcorr.no_depth++; return; }
      s_texcorr.armed++;
      gr_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
@@ -603,33 +755,76 @@ index 41490964..36c32c0b 100644
  }
  
  /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
+@@ -5699,9 +5731,15 @@ static void gp1_display_area_start(uint32_t val) {
+     /* GP1(05h): Start of display area in VRAM
+      * bits 0-9: X (in halfwords, 0-1023)
+      * bits 10-18: Y (0-511) */
++    uint32_t prev_x = display_area_x, prev_y = display_area_y;
+     display_area_x = val & 0x3FF;
+     display_area_y = (val >> 10) & 0x1FF;
+     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
++    /* A buffer flip ends a render: the motion-vector clock (motion_vectors.h). */
++    if (display_area_x != prev_x || display_area_y != prev_y) {
++        extern void psx_mv_render_boundary(void);
++        psx_mv_render_boundary();
++    }
+ }
+ 
+ static void gp1_h_display_range(uint32_t val) {
 diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
-index 2bb0e9f6..0de98153 100644
+index 2bb0e9f6..4e1f5f77 100644
 --- a/runtime/src/gpu_gl_renderer.c
 +++ b/runtime/src/gpu_gl_renderer.c
-@@ -113,6 +113,7 @@
+@@ -113,6 +113,9 @@
  #define PSXGL_FRAMEBUFFER_COMPLETE  0x8CD5
  #define PSXGL_RENDERBUFFER          0x8D41
  #define PSXGL_DEPTH24_STENCIL8      0x88F0
 +#define PSXGL_DEPTH_CLAMP           0x864F
++#define PSXGL_COLOR_ATTACHMENT1     0x8CE1
++#define PSXGL_RGBA16F               0x881A
  #define PSXGL_R16UI                 0x8234
  #define PSXGL_RED_INTEGER           0x8D94
  #define PSXGL_FUNC_ADD              0x8006
-@@ -373,8 +374,11 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+@@ -167,6 +170,7 @@ typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
+ typedef void   (APIENTRY *PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+ typedef GLenum (APIENTRY *PFN_glCheckFramebufferStatus)(GLenum);
+ typedef void   (APIENTRY *PFN_glBlitFramebuffer)(GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLbitfield,GLenum);
++typedef void   (APIENTRY *PFN_glDrawBuffers)(GLsizei, const GLenum *);
+ typedef void   (APIENTRY *PFN_glGenRenderbuffers)(GLsizei, GLuint *);
+ typedef void   (APIENTRY *PFN_glDeleteRenderbuffers)(GLsizei, const GLuint *);
+ typedef void   (APIENTRY *PFN_glBindRenderbuffer)(GLenum, GLuint);
+@@ -230,6 +234,7 @@ static PFN_glBindFramebuffer   p_glBindFramebuffer;
+ static PFN_glFramebufferTexture2D p_glFramebufferTexture2D;
+ static PFN_glCheckFramebufferStatus p_glCheckFramebufferStatus;
+ static PFN_glBlitFramebuffer   p_glBlitFramebuffer;
++static PFN_glDrawBuffers       p_glDrawBuffers;
+ static PFN_glGenQueries          p_glGenQueries;
+ static PFN_glDeleteQueries       p_glDeleteQueries;
+ static PFN_glBeginQuery          p_glBeginQuery;
+@@ -281,6 +286,7 @@ static int load_modern_gl(void) {
+     LOAD(p_glFramebufferTexture2D, "glFramebufferTexture2D");
+     LOAD(p_glCheckFramebufferStatus, "glCheckFramebufferStatus");
+     LOAD(p_glBlitFramebuffer, "glBlitFramebuffer");
++    LOAD(p_glDrawBuffers, "glDrawBuffers");
+     LOAD(p_glGenRenderbuffers, "glGenRenderbuffers");
+     LOAD(p_glDeleteRenderbuffers, "glDeleteRenderbuffers");
+     LOAD(p_glBindRenderbuffer, "glBindRenderbuffer");
+@@ -373,8 +379,12 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
   * q is the perspective weight ([video] perspective_texturing): 0 = affine, the
   * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
   * fragment shader read the noperspective varying — i.e. bit-identical to the
 - * pre-feature pipeline. */
 -#define TEXV 20
 + * pre-feature pipeline.
-+ * z (the 21st float) is the scene-depth value, see s_depth_out. */
-+#define TEXV 21
-+/* Flat/gouraud vertex: pos(2) col(4) z(1). */
-+#define GEOV 7
++ * z (the 21st float) is the scene-depth value, see s_depth_out; prev (22nd,
++ * 23rd) is the previous-game-frame position, see s_mv_out. */
++#define TEXV 23
++/* Flat/gouraud vertex: pos(2) col(4) z(1) prev(2). */
++#define GEOV 9
  static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
  static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
  
-@@ -387,6 +391,22 @@ static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  *
+@@ -387,6 +397,34 @@ static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  *
  static int     s_pq_valid = 0;                  /* perspective weights present */
  static float   s_pq[3];
  
@@ -649,35 +844,105 @@ index 2bb0e9f6..0de98153 100644
 +#define DEPTH_NEAR    1.0f                      /* SZ units, ReShade's near = 1 */
 +#define DEPTH_FAR     65536.0f                  /* SZ is a uint16 */
 +
++/* Motion vectors (gl_renderer_set_motion_output). Same rules as depth: only
++ * triangles PGXP gave a previous-frame position draw motion, written by an
++ * extra pass per opaque batch into a second colour attachment (RGBA16F:
++ * xy = current - previous position in native pixels, z = 1 where written).
++ * Semi-transparent prims leave the motion underneath. Fills clear it. Off,
++ * nothing is allocated or drawn. */
++static int     s_mv_out = 0;
++static int     s_pm_valid = 0;                  /* motion for the next triangle */
++static float   s_pm_dx[3], s_pm_dy[3];          /* motion delta, native px      */
++static GLuint  s_mv_tex = 0;                    /* hr motion target             */
++static GLint   s_uTexMv = -1, s_uGeoMv = -1;    /* u_mvpass                     */
++
  /* TEX program uniforms. */
  static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
  static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
-@@ -1020,6 +1040,7 @@ static const char *GEO_VS =
+@@ -502,6 +540,7 @@ static int s_stencil_valid = 1;
+ #define WIDE_MAX_SURF 4
+ static GLuint s_wide_tex[WIDE_MAX_SURF];     /* color tex per surface (0 = free) */
+ static GLuint s_wide_fbo[WIDE_MAX_SURF];     /* FBO per surface */
++static GLuint s_wide_mv[WIDE_MAX_SURF];      /* motion attachment per surface (s_mv_out) */
+ static GLuint s_wide_rb[WIDE_MAX_SURF];      /* depth-stencil RB per surface (mask
+                                               * mirror, same as hr). PERF-CRITICAL:
+                                               * a stencil-less wide FBO made every
+@@ -1020,24 +1059,30 @@ static const char *GEO_VS =
      "#version 330\n"
      "layout(location=0) in vec2 a_pos;\n"
      "layout(location=1) in vec4 a_col;\n"
 +    "layout(location=2) in float a_z;   /* scene depth 0..1; 0.5 = none */\n"
++    "layout(location=3) in vec2 a_prev; /* previous-frame position (motion) */\n"
      "uniform float u_shift;\n"
      "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
      "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
-@@ -1033,7 +1054,7 @@ static const char *GEO_VS =
+     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
+     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
+-    "noperspective out vec4 v_col;\n"
+-    "void main(){ v_col = a_col;\n"
+-    "  float xb = a_pos.x;\n"
++    "noperspective out vec4 v_col; noperspective out vec2 v_mv;\n"
++    "float wide_x(float xb){\n"
+     "  if (u_xscale < 0.0) {\n"
+     "    float s = -u_xscale; float h = u_xhalf / s;\n"
      "    float l = u_xcenter - h, r = u_xcenter + h;\n"
      "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
      "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
 -    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
++    "  return xb; }\n"
++    "void main(){ v_col = a_col;\n"
++    "  float xb = wide_x(a_pos.x);\n"
++    "  v_mv = vec2(xb - wide_x(a_prev.x), a_pos.y - a_prev.y);\n"
 +    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, a_z*2.0 - 1.0, 1.0); }\n";
  static const char *GEO_FS =
      "#version 330\n"
-     "noperspective in vec4 v_col; out vec4 frag;\n"
-@@ -1062,6 +1083,7 @@ static const char *TEX_VS =
+-    "noperspective in vec4 v_col; out vec4 frag;\n"
+-    "void main(){ frag = v_col; }\n";
++    "noperspective in vec4 v_col; noperspective in vec2 v_mv; out vec4 frag;\n"
++    "uniform int u_mvpass;   /* 1: write motion (attachment 1) instead of colour */\n"
++    "void main(){ frag = (u_mvpass == 1) ? vec4(v_mv, 1.0, 1.0) : v_col; }\n";
+ 
+ /* Textured prims: sample raw 1555 VRAM (integer), CLUT decode per depth,
+  * texture window, optional bilinear, texel-0 discard, STP-split discard,
+@@ -1062,6 +1107,8 @@ static const char *TEX_VS =
      "layout(location=7) in vec4 a_limits;\n"
      "layout(location=8) in float a_semi;\n"
      "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
 +    "layout(location=10) in float a_z;  /* scene depth 0..1; 0.5 = none */\n"
++    "layout(location=11) in vec2 a_prev; /* previous-frame position (motion) */\n"
      "uniform float u_shift;\n"
      "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
      "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
-@@ -1092,7 +1114,9 @@ static const char *TEX_VS =
+@@ -1072,6 +1119,14 @@ static const char *TEX_VS =
+     "flat out int v_persp;\n"
+     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
+     "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
++    "smooth out vec2 v_mv;\n"
++    "float wide_x(float xb){\n"
++    "  if (u_xscale < 0.0) {\n"
++    "    float s = -u_xscale; float h = u_xhalf / s;\n"
++    "    float l = u_xcenter - h, r = u_xcenter + h;\n"
++    "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
++    "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
++    "  return xb; }\n"
+     "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
+     "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
+     "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
+@@ -1080,19 +1135,17 @@ static const char *TEX_VS =
+     "  v_limits = ivec4(floor(a_limits + 0.5));\n"
+     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
+     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
+-    "  float xb = a_pos.x;\n"
+-    "  if (u_xscale < 0.0) {\n"
+-    "    float s = -u_xscale; float h = u_xhalf / s;\n"
+-    "    float l = u_xcenter - h, r = u_xcenter + h;\n"
+-    "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
+-    "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
++    "  float xb = wide_x(a_pos.x);\n"
++    "  v_mv = vec2(xb - wide_x(a_prev.x), a_pos.y - a_prev.y);\n"
+     "  /* Perspective-correct UV rides the standard w divide: emit clip coords\n"
+     "   * pre-multiplied by w = 1/q so the post-divide NDC is unchanged while\n"
+     "   * the rasterizer interpolates the smooth varying hyperbolically. With\n"
      "   * a_q == 0 (feature off) w is exactly 1.0 and this is the old expression. */\n"
      "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
      "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
@@ -688,7 +953,24 @@ index 2bb0e9f6..0de98153 100644
  static const char *TEX_FS =
      "#version 330\n"
      "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
-@@ -1350,10 +1374,29 @@ static void hr_end(void) {
+@@ -1104,6 +1157,8 @@ static const char *TEX_FS =
+     "flat in int v_raw;       /* 1 = no color modulation */\n"
+     "flat in ivec4 v_limits;  /* prim uv sampling bounds (inclusive, post-wrap) */\n"
+     "flat in int v_semi;      /* GP0 command has semi-transparency enabled */\n"
++    "smooth in vec2 v_mv;     /* motion, native px (u_mvpass) */\n"
++    "uniform int u_mvpass;    /* 1: write motion (attachment 1) instead of colour */\n"
+     "uniform usampler2D u_vram;\n"
+     "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
+     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
+@@ -1176,6 +1231,7 @@ static const char *TEX_FS =
+     "  }\n"
+     "  if (u_semipass == 1 && stp == 1) discard;\n"
+     "  if (u_semipass == 2 && stp == 0) discard;\n"
++    "  if (u_mvpass == 1) { frag = vec4(v_mv, 1.0, 1.0); blend_factor = vec4(0.0); return; }\n"
+     "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+     "  float dst_factor = 0.0;\n"
+     "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
+@@ -1350,10 +1406,72 @@ static void hr_end(void) {
          p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
      glDisable(GL_STENCIL_TEST);
      glDisable(GL_SCISSOR_TEST);
@@ -715,18 +997,73 @@ index 2bb0e9f6..0de98153 100644
 +static inline float depth_vertex(int i) {
 +    return (s_depth_out && s_pz_valid) ? s_pz[i] : DEPTH_NEUTRAL;
 +}
++/* Per-vertex previous-frame position: the motion-vector source, or the
++ * current position (zero motion) when the triangle has none. */
++static inline float prev_vertex_x(int i, float cur) {
++    return (s_mv_out && s_pm_valid) ? cur - s_pm_dx[i] : cur;
++}
++static inline float prev_vertex_y(int i, float cur) {
++    return (s_mv_out && s_pm_valid) ? cur - s_pm_dy[i] : cur;
++}
++/* Redraw the bound batch into the motion attachment of the bound target (hr
++ * or a wide surface — both carry one when s_mv_out). Same program, uniforms
++ * and stencil test as the colour pass, so coverage and cutout discards match;
++ * blending, stencil writes and depth writes are off. */
++static void mv_pass(GLint u_mvpass, int nverts) {
++    GLenum buf = PSXGL_COLOR_ATTACHMENT1;
++    p_glDrawBuffers(1, &buf);
++    glDisable(GL_BLEND);
++    glStencilMask(0x00);
++    glDepthMask(GL_FALSE);
++    p_glUniform1i(u_mvpass, 1);
++    glDrawArrays(GL_TRIANGLES, 0, nverts);
++    p_glUniform1i(u_mvpass, 0);
++    buf = PSXGL_COLOR_ATTACHMENT0;
++    p_glDrawBuffers(1, &buf);
++    glStencilMask(0x01);
++    glDepthMask(GL_TRUE);
++}
++/* Reset scene depth (far) and motion (none) in the bound target, inside the
++ * current scissor — called wherever the game's own fills clear colour. */
++static void scene_aux_clear(void) {
++    if (s_depth_out) {
++        glDepthMask(GL_TRUE);
++        glClearDepth(1.0);
++        glClear(GL_DEPTH_BUFFER_BIT);
++    }
++    if (s_mv_out) {
++        GLenum buf = PSXGL_COLOR_ATTACHMENT1;
++        p_glDrawBuffers(1, &buf);
++        glClearColor(0.f, 0.f, 0.f, 0.f);
++        glClear(GL_COLOR_BUFFER_BIT);
++        buf = PSXGL_COLOR_ATTACHMENT0;
++        p_glDrawBuffers(1, &buf);
++    }
++}
  
  /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
  /* CPU-side VRAM writes (GP0 A0 transfers, DMA, single pixel pokes) land in
-@@ -1738,6 +1781,7 @@ static int   s_tb_n = 0;                    /* verts queued */
+@@ -1738,6 +1856,8 @@ static int   s_tb_n = 0;                    /* verts queued */
  static int   s_tb_semi = -2;
  static int   s_tb_mask = 0, s_tb_filter = 0;
  static int   s_tb_twin[4] = {0, 0, 0, 0};
 +static int   s_tb_z = 0;                    /* batch writes scene depth */
++static int   s_tb_mv = 0;                   /* batch writes motion      */
  static uint64_t s_batch_total = 0, s_batch_reason[7];
  
  void gl_renderer_batch_diag(uint64_t out[8]) {
-@@ -1856,6 +1900,7 @@ static void flush_tex_batch(void) {
+@@ -1802,6 +1922,10 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+         p_glUniform1i(s_uSemipass, 2);
+         glDrawArrays(GL_TRIANGLES, 0, nverts);
+     }
++    if (s_mv_out && s_tb_mv && semi < 0) {             /* motion: opaque batches only */
++        p_glUniform1i(s_uSemipass, 0);
++        mv_pass(s_uTexMv, nverts);
++    }
+ }
+ 
+ /* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
+@@ -1856,6 +1980,7 @@ static void flush_tex_batch(void) {
      p_glBindVertexArray(s_tex_vao);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
      p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -734,7 +1071,7 @@ index 2bb0e9f6..0de98153 100644
  
      tex_batch_draw_passes(nverts, semi);
  
-@@ -1883,16 +1928,17 @@ static void flush_tex_batch(void) {
+@@ -1883,16 +2008,18 @@ static void flush_tex_batch(void) {
   * GP0(68h) 1x1 dots; each was two immediate gpu_triangle draws (BufferData +
   * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
  #define FLATBATCH_MAXV 8190                 /* multiple of 3 */
@@ -744,6 +1081,7 @@ index 2bb0e9f6..0de98153 100644
  static int   s_fb_semi = -2;
  static int   s_fb_mask = -1;
 +static int   s_fb_z = 0;                    /* batch writes scene depth */
++static int   s_fb_mv = 0;                   /* batch writes motion      */
  
  static int mirror_flat_batch_center_only(int nverts) {
      if (!s_wide_fast || nverts <= 0) return 0;
@@ -754,7 +1092,7 @@ index 2bb0e9f6..0de98153 100644
          if (x < flo) flo = x; if (x > fhi) fhi = x;
      }
      /* floor/ceil rather than a truncating cast — see mirror_batch_center_only. */
-@@ -1910,8 +1956,9 @@ static void flush_flat_batch(void) {
+@@ -1910,9 +2037,11 @@ static void flush_flat_batch(void) {
      p_glUseProgram(s_geo_prog);
      p_glBindVertexArray(s_geo_vao);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -763,9 +1101,23 @@ index 2bb0e9f6..0de98153 100644
                     s_fb, PSXGL_STREAM_DRAW);
 +    depth_write_begin(s_fb_z);
      glDrawArrays(GL_TRIANGLES, 0, nverts);
++    if (s_mv_out && s_fb_mv && semi < 0) mv_pass(s_uGeoMv, nverts);
  
      if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
-@@ -1943,15 +1990,16 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+         !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts))) {
+@@ -1922,7 +2051,10 @@ static void flush_flat_batch(void) {
+         gl_perf_mirror_begin();
+         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
+         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
+-        if (s_ws_ablate != 2) glDrawArrays(GL_TRIANGLES, 0, nverts);
++        if (s_ws_ablate != 2) {
++            glDrawArrays(GL_TRIANGLES, 0, nverts);
++            if (s_mv_out && s_fb_mv && semi < 0) mv_pass(s_uGeoMv, nverts);
++        }
+         wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
+         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
+         gl_perf_mirror_end();
+@@ -1943,15 +2075,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
      /* Lines stay immediate (rare); tris batch for MotK 0x68 starfields. */
      if (mode != GL_TRIANGLES || n < 3) {
          flush_flat_batch();
@@ -786,10 +1138,12 @@ index 2bb0e9f6..0de98153 100644
 +            verts[i*GEOV+4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
 +            verts[i*GEOV+5] = mask_a;
 +            verts[i*GEOV+6] = DEPTH_NEUTRAL;   /* lines carry no depth */
++            verts[i*GEOV+7] = verts[i*GEOV+0]; /* ... or motion */
++            verts[i*GEOV+8] = verts[i*GEOV+1];
          }
          hr_begin(1);
          if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
-@@ -1960,7 +2008,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1960,7 +2095,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
          p_glUseProgram(s_geo_prog);
          p_glBindVertexArray(s_geo_vao);
          p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -798,20 +1152,22 @@ index 2bb0e9f6..0de98153 100644
                         verts, PSXGL_STREAM_DRAW);
          glDrawArrays(mode, 0, n);
          if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
-@@ -1979,22 +2027,26 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1979,22 +2114,30 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
          return;
      }
  
 -    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set))
 +    int has_z = s_depth_out && s_pz_valid;
++    int has_mv = s_mv_out && s_pm_valid;
 +    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set ||
-+                       s_fb_z != has_z))
++                       s_fb_z != has_z || s_fb_mv != has_mv))
          flush_flat_batch();
      if (s_fb_n + n > FLATBATCH_MAXV)
          flush_flat_batch();
      s_fb_semi = semi;
      s_fb_mask = (int)s_mask_set;
 +    s_fb_z = has_z;
++    s_fb_mv = has_mv;
  
      float mask_a = s_mask_set ? 1.0f : 0.0f;
      for (int i = 0; i < n; i++) {
@@ -824,57 +1180,60 @@ index 2bb0e9f6..0de98153 100644
          v[4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
          v[5] = mask_a;
 +        v[6] = depth_vertex(i);
++        v[7] = prev_vertex_x(i, v[0]);
++        v[8] = prev_vertex_y(i, v[1]);
          s_fb_n++;
      }
  }
-@@ -2092,8 +2144,13 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+@@ -2092,8 +2235,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
              s_batch_reason[reason]++;
              flush_tex_batch();
          }
 +        /* Depth-writing and depth-less prims cannot share a draw (depth writes
 +         * are per draw). Off, has_z is always 0 and this never splits. */
 +        int has_z = s_depth_out && s_pz_valid;
-+        if (s_tb_n > 0 && has_z != s_tb_z) flush_tex_batch();
++        int has_mv = s_mv_out && s_pm_valid;
++        if (s_tb_n > 0 && (has_z != s_tb_z || has_mv != s_tb_mv)) flush_tex_batch();
          if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
          if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
 +            s_tb_z = has_z;
++            s_tb_mv = has_mv;
              s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
              s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
          }
-@@ -2110,6 +2167,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+@@ -2110,6 +2260,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
              vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
              vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
              vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
 +            vp[20] = depth_vertex(i);                               /* a_z */
++            vp[21] = prev_vertex_x(i, vp[0]);                       /* a_prev */
++            vp[22] = prev_vertex_y(i, vp[1]);
          }
          s_tb_n += 3;
          if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
-@@ -2128,9 +2186,10 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int
+@@ -2128,9 +2281,10 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int
      float b = (((c >> 10) & 0x1F) << 3) / 255.0f;
      float a = s_mask_set ? 1.0f : 0.0f;
      float fx0 = (float)wx, fy0 = (float)y, fx1 = (float)(wx + ww), fy1 = (float)(y + h);
 -    float verts[6 * 6] = {
 -        fx0,fy0,r,g,b,a,  fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,
 -        fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,  fx1,fy1,r,g,b,a,
-+    const float z = DEPTH_NEUTRAL;
++    const float z = DEPTH_NEUTRAL;   /* overlay: no depth, zero motion */
 +    float verts[6 * GEOV] = {
-+        fx0,fy0,r,g,b,a,z,  fx1,fy0,r,g,b,a,z,  fx0,fy1,r,g,b,a,z,
-+        fx1,fy0,r,g,b,a,z,  fx0,fy1,r,g,b,a,z,  fx1,fy1,r,g,b,a,z,
++        fx0,fy0,r,g,b,a,z,fx0,fy0,  fx1,fy0,r,g,b,a,z,fx1,fy0,  fx0,fy1,r,g,b,a,z,fx0,fy1,
++        fx1,fy0,r,g,b,a,z,fx1,fy0,  fx0,fy1,r,g,b,a,z,fx0,fy1,  fx1,fy1,r,g,b,a,z,fx1,fy1,
      };
      /* Wide target: positions already wide-space so u_xoff = 0; full-width
       * scissor; u_xhalf = g_wide_w/2. */
-@@ -2224,7 +2283,9 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b)
-     glClearColor(r, g, b, 0.0f);
+@@ -2225,6 +2379,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b)
      glClearStencil(0);
      glStencilMask(0xFF);
--    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-+    glClearDepth(1.0);   /* scene depth: a fill is background, i.e. far */
-+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT |
-+            (s_depth_out ? GL_DEPTH_BUFFER_BIT : 0));
+     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
++    scene_aux_clear();   /* a fill is background: depth far, no motion */
      rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
  }
  
-@@ -2375,6 +2436,18 @@ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float
+@@ -2375,6 +2530,30 @@ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float
      s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
      sw_set_perspective_triangle(enabled, q0, q1, q2);
  }
@@ -889,20 +1248,68 @@ index 2bb0e9f6..0de98153 100644
 +        s_pz[i] = k * (1.0f - DEPTH_NEAR / (float)z[i]);
 +}
 +void gl_renderer_set_depth_output(int on) { s_depth_out = on ? 1 : 0; }
++static void glb_set_triangle_motion(int valid, const int32_t dx16[3], const int32_t dy16[3]) {
++    s_pm_valid = valid ? 1 : 0;
++    if (!s_pm_valid) return;
++    for (int i = 0; i < 3; i++) {
++        s_pm_dx[i] = (float)dx16[i] / 65536.0f;
++        s_pm_dy[i] = (float)dy16[i] / 65536.0f;
++    }
++}
++/* Must be set before the renderer initialises (mods activate first); the
++ * motion attachments are only allocated when it is on. */
++void gl_renderer_set_motion_output(int on) { s_mv_out = on ? 1 : 0; }
++int  gl_renderer_get_motion_output(void)   { return s_mv_out; }
 +int  gl_renderer_get_depth_output(void)   { return s_depth_out; }
  static void glb_set_draw_area(int x1,int y1,int x2,int y2) { flush_flat_batch(); flush_tex_batch(); s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
  static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
  static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_batch(); s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
-@@ -2385,7 +2458,7 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
+@@ -2385,7 +2564,7 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
   * SW @ 1× for authority, then GPU @ s_scale for present quality. */
  /* The sub-pixel / perspective override describes exactly one triangle; drop it
   * once that triangle has been submitted so a later prim can never inherit it. */
 -static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; }
-+static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; s_pz_valid = 0; }
++static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; s_pz_valid = 0; s_pm_valid = 0; }
  
  static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
      if (s_cpu_auth_dual || !s_raster_ok)
-@@ -2877,10 +2950,12 @@ static int init_gpu_raster(void) {
+@@ -2538,6 +2717,7 @@ static void depth24_clear_skipped_fb(void) {
+     glClearStencil(0);
+     glStencilMask(0xFF);
+     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
++    scene_aux_clear();
+     if (s_raw_fbo) {
+         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
+         glViewport(0, 0, VRAM_W, VRAM_H);
+@@ -2810,6 +2990,18 @@ static int init_gpu_raster(void) {
+     p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
+ 
+     if (!make_fbo(&s_hr_fbo, s_hr_tex, s_hr_rb)) return 0;
++    if (s_mv_out && !p_glDrawBuffers) s_mv_out = 0;
++    if (s_mv_out) {
++        s_mv_tex = make_tex(PSXGL_RGBA16F, hw, hh, GL_RGBA, GL_FLOAT);
++        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
++        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, s_mv_tex, 0);
++        if (p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER) != PSXGL_FRAMEBUFFER_COMPLETE) {
++            p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
++            glDeleteTextures(1, &s_mv_tex); s_mv_tex = 0;
++            s_mv_out = 0;
++        }
++        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    }
+     if (!make_fbo(&s_raw_fbo, s_raw_tex, 0)) return 0;
+     if (!make_fbo(&s_scratch_fbo, s_scratch_tex, 0)) return 0;
+ 
+@@ -2824,6 +3016,8 @@ static int init_gpu_raster(void) {
+     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
+     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
+     s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
++    s_uTexMv    = p_glGetUniformLocation(s_tex_prog, "u_mvpass");
++    s_uGeoMv    = p_glGetUniformLocation(s_geo_prog, "u_mvpass");
+     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
+     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
+     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
+@@ -2877,10 +3071,14 @@ static int init_gpu_raster(void) {
      p_glBindVertexArray(s_geo_vao);
      p_glGenBuffers(1, &s_geo_vbo);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -914,18 +1321,29 @@ index 2bb0e9f6..0de98153 100644
      p_glEnableVertexAttribArray(1);
 +    p_glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)(6 * sizeof(float)));
 +    p_glEnableVertexAttribArray(2);
++    p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)(7 * sizeof(float)));
++    p_glEnableVertexAttribArray(3);
  
      p_glGenVertexArrays(1, &s_tex_vao);
      p_glBindVertexArray(s_tex_vao);
-@@ -2898,6 +2973,7 @@ static int init_gpu_raster(void) {
+@@ -2898,6 +3096,8 @@ static int init_gpu_raster(void) {
          p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
          p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
          p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
 +        p_glVertexAttribPointer(10, 1, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10); /* z      */
++        p_glVertexAttribPointer(11, 2, GL_FLOAT, GL_FALSE, st, (void*)(21*sizeof(float))); p_glEnableVertexAttribArray(11); /* prev   */
      }
  
      p_glGenVertexArrays(1, &s_blit_vao);
-@@ -2954,6 +3030,7 @@ int gl_renderer_init_context(SDL_Window *win) {
+@@ -2919,6 +3119,7 @@ static int init_gpu_raster(void) {
+     glClearStencil(0);
+     glStencilMask(0xFF);
+     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
++    scene_aux_clear();
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+     rect_clear(&s_pack_dirty);
+     s_up_nrects = 0;
+@@ -2954,6 +3155,7 @@ int gl_renderer_init_context(SDL_Window *win) {
      s_present_h = 0;
      SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
      SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -933,17 +1351,58 @@ index 2bb0e9f6..0de98153 100644
      s_ctx = SDL_GL_CreateContext(win);
      if (!s_ctx) { fprintf(stdout, "psxrecomp: GL context creation failed (%s)\n", SDL_GetError()); return 0; }
      if (SDL_GL_MakeCurrent(win, s_ctx) != 0) { fprintf(stdout, "psxrecomp: MakeCurrent failed (%s)\n", SDL_GetError()); SDL_GL_DeleteContext(s_ctx); s_ctx=NULL; return 0; }
-@@ -3391,7 +3468,8 @@ static GLuint wide_fbo_for(int base_x) {
+@@ -3357,6 +3559,7 @@ static void wide_free_all(void) {
+         if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
+         if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
+         if (s_wide_rb[i])  { p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0; }
++        if (s_wide_mv[i])  { glDeleteTextures(1, &s_wide_mv[i]); s_wide_mv[i] = 0; }
+         s_wide_base[i] = -1;
+     }
+     g_wide_cur = 0;
+@@ -3387,11 +3590,19 @@ static GLuint wide_fbo_for(int base_x) {
+             }
+             /* Clear to black so unwritten margins are clean (not stale). */
+             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_wide_fbo[i]);
++            if (s_mv_out) {
++                s_wide_mv[i] = make_tex(PSXGL_RGBA16F, w, h, GL_RGBA, GL_FLOAT);
++                p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_wide_fbo[i]);
++                p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT1,
++                                         GL_TEXTURE_2D, s_wide_mv[i], 0);
++            }
+             glDisable(GL_SCISSOR_TEST);
              glClearColor(0, 0, 0, 0);
              glClearStencil(0);
              glStencilMask(0xFF);
 -            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 +            glClearDepth(1.0);
 +            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++            scene_aux_clear();
              p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
              s_wide_base[i] = base_x;
              return s_wide_fbo[i];
-@@ -4105,6 +4183,11 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+@@ -3454,6 +3665,7 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
+     glClearStencil((color >> 15) & 1);   /* stencil mirrors bit15, like the color alpha */
+     glStencilMask(0xFF);
+     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
++    scene_aux_clear();
+     glDisable(GL_SCISSOR_TEST);
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+     gl_perf_mirror_end();
+@@ -3493,10 +3705,13 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
+     if (sides & 1) {
+         glScissor(0, y0, margin, y1 - y0);
+         glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
++        scene_aux_clear();
++        glClearColor(r, g, b, a);
+     }
+     if (sides & 2) {
+         glScissor(W - margin, y0, margin, y1 - y0);
+         glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
++        scene_aux_clear();
+     }
+     glDisable(GL_SCISSOR_TEST);
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+@@ -4105,6 +4320,11 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
  }
  
  /* Composite host toast + volume bar into the default framebuffer, then swap. */
@@ -955,7 +1414,7 @@ index 2bb0e9f6..0de98153 100644
  static void gl_swap_with_osd(void) {
      if (s_present_prog && s_ctx) {
          int ww = 0, wh = 0;
-@@ -4157,9 +4240,28 @@ static void gl_swap_with_osd(void) {
+@@ -4157,9 +4377,28 @@ static void gl_swap_with_osd(void) {
              if (ww > 0 && wh > 0) {
                  uint8_t *rows = (uint8_t *)malloc((size_t)ww * wh * 3);
                  uint8_t *flip = rows ? (uint8_t *)malloc((size_t)ww * wh * 3) : NULL;
@@ -985,7 +1444,7 @@ index 2bb0e9f6..0de98153 100644
                      for (int y = 0; y < wh; y++)
                          memcpy(flip + (size_t)y * ww * 3,
                                 rows + (size_t)(wh - 1 - y) * ww * 3,
-@@ -4174,6 +4276,7 @@ static void gl_swap_with_osd(void) {
+@@ -4174,6 +4413,7 @@ static void gl_swap_with_osd(void) {
                  free(flip);
                  free(rows);
              }
@@ -993,7 +1452,7 @@ index 2bb0e9f6..0de98153 100644
              present_shot_done(wrote);
          }
      }
-@@ -4240,6 +4343,41 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+@@ -4240,6 +4480,85 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
      p_glUseProgram(0);
  }
  
@@ -1032,18 +1491,63 @@ index 2bb0e9f6..0de98153 100644
 +    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 +}
 +
++/* Motion capture for the accuracy check (debug server "mv_capture"). Reads
++ * the displayed region of the target the frame is presented from, so colour
++ * and motion are the same frame. Raw files; tools/soup/mv_check.py reads them. */
++static char s_mvcap_dir[512];
++static int  s_mvcap_left = 0, s_mvcap_seq = 0;
++void gl_renderer_mv_capture(const char *dir, int count) {
++    snprintf(s_mvcap_dir, sizeof s_mvcap_dir, "%s", dir ? dir : ".");
++    s_mvcap_seq = 0;
++    s_mvcap_left = count > 0 ? count : 0;
++}
++int gl_renderer_mv_capture_left(void) { return s_mvcap_left; }
++static void mv_capture_frame(GLuint fbo, int x, int y, int w, int h) {
++    extern unsigned long long psx_mv_frame_count(void);
++    if (s_mvcap_left <= 0 || !s_mv_out || w <= 0 || h <= 0) return;
++    const int S = s_scale, W = w * S, H = h * S;
++    uint8_t *rgba = (uint8_t *)malloc((size_t)W * H * 4);
++    float *mv = (float *)malloc((size_t)W * H * 4 * sizeof(float));
++    if (rgba && mv) {
++        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
++        glReadPixels(x * S, y * S, W, H, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++        glReadBuffer(PSXGL_COLOR_ATTACHMENT1);
++        glReadPixels(x * S, y * S, W, H, GL_RGBA, GL_FLOAT, mv);
++        glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
++        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++        char path[600];
++        FILE *f;
++        snprintf(path, sizeof path, "%s/f%04d.rgba", s_mvcap_dir, s_mvcap_seq);
++        if ((f = fopen(path, "wb"))) { fwrite(rgba, 4, (size_t)W * H, f); fclose(f); }
++        snprintf(path, sizeof path, "%s/f%04d.mv", s_mvcap_dir, s_mvcap_seq);
++        if ((f = fopen(path, "wb"))) { fwrite(mv, 4 * sizeof(float), (size_t)W * H, f); fclose(f); }
++        snprintf(path, sizeof path, "%s/f%04d.txt", s_mvcap_dir, s_mvcap_seq);
++        if ((f = fopen(path, "w"))) {
++            fprintf(f, "%d %d %d %llu\n", W, H, S, psx_mv_frame_count());
++            fclose(f);
++        }
++    }
++    free(rgba);
++    free(mv);
++    s_mvcap_seq++;
++    s_mvcap_left--;
++}
++
  /* Bezel art: a still image behind the frame, filling whatever the letterbox or
   * pillarbox leaves over. It never samples the frame, so unlike an edge-stretch
   * backdrop it is independent of what the game is currently drawing. */
-@@ -4397,6 +4535,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+@@ -4397,6 +4716,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
      present_bezel(ww, wh, lx, ly, lw, lh);
      present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                          disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
 +    present_scene_depth(s_hr_fbo, disp_x, disp_y, w, h, lx, ly, lw, lh);
++    mv_capture_frame(s_hr_fbo, disp_x, disp_y, w, h);
      pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4439,7 +4578,9 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
+@@ -4439,7 +4760,22 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
                          (base_x + native_w) * S, VRAM_H * S,
                          g_wide_off * S, 0,
                          (g_wide_off + native_w) * S, VRAM_H * S,
@@ -1051,30 +1555,45 @@ index 2bb0e9f6..0de98153 100644
 +                        GL_COLOR_BUFFER_BIT |
 +                            (s_depth_out ? GL_DEPTH_BUFFER_BIT : 0),
 +                        GL_NEAREST);
++    if (s_mv_out) {
++        GLenum buf = PSXGL_COLOR_ATTACHMENT1;
++        glReadBuffer(PSXGL_COLOR_ATTACHMENT1);
++        p_glDrawBuffers(1, &buf);
++        p_glBlitFramebuffer(base_x * S, 0,
++                            (base_x + native_w) * S, VRAM_H * S,
++                            g_wide_off * S, 0,
++                            (g_wide_off + native_w) * S, VRAM_H * S,
++                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        buf = PSXGL_COLOR_ATTACHMENT0;
++        glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
++        p_glDrawBuffers(1, &buf);
++    }
      p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
      p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
  }
-@@ -4501,6 +4642,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+@@ -4501,6 +4837,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
      }
      present_target_quad(tex, g_wide_w, VRAM_H,
                          0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1);
 +    present_scene_depth(fbo, 0, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
++    mv_capture_frame(fbo, 0, disp_y, g_wide_w, disp_h);
      pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4524,6 +4666,7 @@ static const GpuRenderBackend GL_BACKEND = {
+@@ -4524,6 +4862,8 @@ static const GpuRenderBackend GL_BACKEND = {
      .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
      .set_precise_triangle = glb_set_precise_triangle,
      .set_perspective_triangle = glb_set_perspective_triangle,
 +    .set_triangle_depth = glb_set_triangle_depth,
++    .set_triangle_motion = glb_set_triangle_motion,
      .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
      .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
      .draw_textured_triangle = glb_draw_textured_triangle,
 diff --git a/runtime/src/gpu_render.c b/runtime/src/gpu_render.c
-index c833f491..4bf55526 100644
+index c833f491..572b73cd 100644
 --- a/runtime/src/gpu_render.c
 +++ b/runtime/src/gpu_render.c
-@@ -112,6 +112,10 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+@@ -112,6 +112,14 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
      if (g_b->set_perspective_triangle)
          g_b->set_perspective_triangle(enabled, q0, q1, q2);
  }
@@ -1082,14 +1601,27 @@ index c833f491..4bf55526 100644
 +    if (g_b->set_triangle_depth)
 +        g_b->set_triangle_depth(valid, z0, z1, z2);
 +}
++void gr_set_triangle_motion(int valid, const int32_t dx16[3], const int32_t dy16[3]) {
++    if (g_b->set_triangle_motion)
++        g_b->set_triangle_motion(valid, dx16, dy16);
++}
  void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { g_b->fill_rect(x, y, w, h, c); }
  void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
  void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
 diff --git a/runtime/src/gte.cpp b/runtime/src/gte.cpp
-index 211007b9..54b02798 100644
+index 211007b9..737a0694 100644
 --- a/runtime/src/gte.cpp
 +++ b/runtime/src/gte.cpp
-@@ -748,7 +748,8 @@ extern "C" int gte_latch_dump_json(char* out, int outsz, int max_count) {
+@@ -2,6 +2,8 @@
+ #include "cpu_state.h"
+ #include "nd_intro_ot.h"
+ #include "pgxp.h"
++#include "mod_plugins.h"   /* psx_mod_read_* for motion-vector camera reads */
++#include "motion_vectors.h"
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstdio>
+@@ -748,7 +750,8 @@ extern "C" int gte_latch_dump_json(char* out, int outsz, int max_count) {
  /* Format up to max_count recent entries as a JSON array body (no outer braces).
   * If frame_filter >= 0, only entries with that frame are emitted. Returns count. */
  extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
@@ -1099,7 +1631,7 @@ index 211007b9..54b02798 100644
      if (!s_gte_rtp_ring || outsz < 64) { if (out && outsz) out[0]=0; return 0; }
      uint64_t total = s_gte_rtp_seq;
      if (total == 0) { out[0]=0; return 0; }
-@@ -759,6 +760,7 @@ extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
+@@ -759,6 +762,7 @@ extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
          if (seq < oldest || seq >= total) break;
          const GteRtpRec* e = &s_gte_rtp_ring[seq % GTE_RTP_RING_CAP];
          if (frame_filter >= 0 && e->frame != (uint32_t)frame_filter) continue;
@@ -1107,6 +1639,150 @@ index 211007b9..54b02798 100644
          auto sxx = [](int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x10000:v; };
          auto syy = [](int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; };
          if (pos > outsz - 700) break;
+@@ -791,6 +795,113 @@ extern "C" void gte_set_display_aspect(int num, int den) {
+     s_ws_xden = d / a;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Motion vectors (presentation only). A game mod names where its camera lives
++// in guest RAM — a rotation (3x3 int16, the same matrix the GTE uses for
++// static world geometry) and an offset (int32[3], -camera position, added to
++// world points before rotation). The clock is the render, not game logic:
++// gpu.c calls psx_mv_render_boundary() when the game flips its display buffer,
++// and the camera latched at each render's first projection becomes "previous"
++// for the next (Wipeout's game logic runs at 30 fps but trackside cameras
++// render at 60). Every projection then also gets the screen position its point
++// had in the previous render, assuming the point is static in the world:
++//     W + off  = Rᵀ·view           (view = MAC, R = camera rotation / 4096)
++//     view'    = R'·(Rᵀ·view − off + off')
++// projected with this projection's own H/OFX/OFY and widescreen X factor.
++// Projections whose RT isn't the camera rotation (moving objects) get no
++// motion yet. Nothing here changes what the game computes.
++// ---------------------------------------------------------------------------
++struct MvCamera { int16_t r[9]; int32_t off[3]; };
++static int      s_mv_on = 0;
++static uint32_t s_mv_rot_addr = 0, s_mv_off_addr = 0;
++static MvCamera s_mv_prev;                /* camera of the previous render  */
++static int      s_mv_have_prev = 0;
++static MvCamera s_mv_latch;               /* camera of the current render   */
++static int      s_mv_latched = 0;
++static struct { uint64_t frames, proj, static_proj, produced, behind; } s_mv_stats;
++/* Timing diagnostic: per game frame, the offset at frame end and the offsets
++ * live at its first and last static projection (debug server mv_stats). */
++struct MvFrameRec { int32_t end_off[3], first_off[3], last_off[3]; uint32_t nproj; };
++static MvFrameRec s_mv_hist[8];
++static MvFrameRec s_mv_cur_rec;
++
++static void mv_read_camera(MvCamera* c) {
++    for (int i = 0; i < 9; i++) c->r[i] = (int16_t)psx_mod_read_half(s_mv_rot_addr + i * 2);
++    for (int i = 0; i < 3; i++) c->off[i] = (int32_t)psx_mod_read_word(s_mv_off_addr + i * 4);
++}
++extern "C" void psx_mv_enable(int on) { s_mv_on = on ? 1 : 0; s_mv_have_prev = 0; s_mv_latched = 0; }
++extern "C" void psx_mv_set_camera(uint32_t rot_addr, uint32_t off_addr) {
++    if (rot_addr != s_mv_rot_addr || off_addr != s_mv_off_addr) s_mv_have_prev = s_mv_latched = 0;
++    s_mv_rot_addr = rot_addr;
++    s_mv_off_addr = off_addr;
++}
++extern "C" void psx_mv_render_boundary(void) {
++    if (!s_mv_on || !s_mv_rot_addr || !s_mv_latched) return;   /* no 3D this render */
++    s_mv_prev = s_mv_latch;
++    s_mv_have_prev = 1;
++    s_mv_latched = 0;
++    MvCamera now;
++    mv_read_camera(&now);
++    for (int i = 0; i < 3; i++) s_mv_cur_rec.end_off[i] = now.off[i];
++    s_mv_hist[s_mv_stats.frames % 8] = s_mv_cur_rec;
++    memset(&s_mv_cur_rec, 0, sizeof s_mv_cur_rec);
++    s_mv_have_prev = 1;
++    s_mv_stats.frames++;
++}
++extern "C" unsigned long long psx_mv_frame_count(void) { return s_mv_stats.frames; }
++extern "C" int psx_mv_stats_json(char* out, int n) {
++    int k = 0;
++    k += snprintf(out + k, n - k, "\"hist\":[");
++    for (int j = 0; j < 8 && k < n; j++) {
++        const MvFrameRec* h = &s_mv_hist[(s_mv_stats.frames + j) % 8];
++        k += snprintf(out + k, n - k, "%s{\"n\":%u,\"first\":[%d,%d,%d],\"last\":[%d,%d,%d],\"end\":[%d,%d,%d]}",
++                      j ? "," : "", h->nproj, h->first_off[0], h->first_off[1], h->first_off[2],
++                      h->last_off[0], h->last_off[1], h->last_off[2],
++                      h->end_off[0], h->end_off[1], h->end_off[2]);
++    }
++    k += snprintf(out + k, n - k, "],");
++    return k + snprintf(out + k, n - k, "\"on\":%d,\"rot\":\"0x%08X\",\"off\":\"0x%08X\",\"have_prev\":%d,"
++                    "\"frames\":%llu,\"projections\":%llu,\"static\":%llu,\"produced\":%llu,\"behind\":%llu",
++                    s_mv_on, s_mv_rot_addr, s_mv_off_addr, s_mv_have_prev,
++                    (unsigned long long)s_mv_stats.frames, (unsigned long long)s_mv_stats.proj,
++                    (unsigned long long)s_mv_stats.static_proj, (unsigned long long)s_mv_stats.produced,
++                    (unsigned long long)s_mv_stats.behind);
++}
++static void mv_project_prev(const GTEState* gte, int64_t mac1, int64_t mac2, int64_t mac3,
++                            double xk, int64_t sx16, int64_t sy16) {
++    s_mv_stats.proj++;
++    MvCamera cur;
++    mv_read_camera(&cur);
++    for (int r = 0; r < 3; r++)
++        for (int c = 0; c < 3; c++)
++            if (gte->RT[r][c] != cur.r[r * 3 + c]) return;   /* not static world */
++    s_mv_stats.static_proj++;
++    if (!s_mv_latched) { s_mv_latch = cur; s_mv_latched = 1; }
++    if (!s_mv_have_prev) return;
++    if (s_mv_cur_rec.nproj++ == 0)
++        for (int i = 0; i < 3; i++) s_mv_cur_rec.first_off[i] = cur.off[i];
++    for (int i = 0; i < 3; i++) s_mv_cur_rec.last_off[i] = cur.off[i];
++    const double view[3] = { mac1 / 4096.0, mac2 / 4096.0, mac3 / 4096.0 };
++    double w[3], vp[3];
++    for (int i = 0; i < 3; i++) {
++        double a = 0;
++        for (int k = 0; k < 3; k++) a += cur.r[k * 3 + i] * view[k];
++        w[i] = a / 4096.0 - cur.off[i] + s_mv_prev.off[i];
++    }
++    for (int i = 0; i < 3; i++) {
++        double a = 0;
++        for (int k = 0; k < 3; k++) a += s_mv_prev.r[i * 3 + k] * w[k];
++        vp[i] = a / 4096.0;
++    }
++    if (vp[2] < 1.0) { s_mv_stats.behind++; return; }
++    const double lim = 4096.0 * 65536.0;
++    double px = gte->OFX + xk * gte->H * vp[0] / vp[2] * 65536.0;
++    double py = gte->OFY + gte->H * vp[1] / vp[2] * 65536.0;
++    if (px < -lim || px >= lim || py < -lim || py >= lim) return;
++    pgxp_gte_set_motion((int32_t)((double)sx16 - px), (int32_t)((double)sy16 - py));
++    s_mv_stats.produced++;
++}
++
+ // ---------------------------------------------------------------------------
+ // RTPS — Perspective Transformation (internal, operates on given vertex V)
+ //
+@@ -869,8 +980,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+             if (!s_gte_replay_sandbox) s_ws_sz_far++;
+         }
+     }
+-    if (do_squash)
++    double mv_xk = 1.0;   /* the X factor applied below, for motion vectors */
++    if (do_squash) {
+         xterm = xterm * s_ws_xnum / s_ws_xden;
++        mv_xk = (double)s_ws_xnum / s_ws_xden;
++    }
+     // Native-wide dome expansion remains a diagnostic-only depth probe.
+     else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
+              !gpu_ws_present_native_43()) {
+@@ -882,6 +996,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+         }
+         if (sz >= s_ws_far_threshold) {
+             xterm = xterm * s_ws_dome_num / s_ws_dome_den;
++            mv_xk = (double)s_ws_dome_num / s_ws_dome_den;
+             if (!s_gte_replay_sandbox) s_ws_sz_far++;
+         }
+     }
+@@ -899,6 +1014,8 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+         int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
+         pgxp_gte_push_sxy((int32_t)cx16, (int32_t)cy16, gte->SZ[3],
+                           (uint32_t)gte->SXY[2]);
++        if (s_mv_on && s_mv_rot_addr)
++            mv_project_prev(gte, mac1, mac2, mac3, mv_xk, sx16, sy16);
+     }
+     geom_note((uint32_t)gte->SXY[2], sx16, sy16);
+ 
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
 index 209622c2..bbb7198a 100644
 --- a/runtime/src/main.cpp
@@ -1121,3 +1797,59 @@ index 209622c2..bbb7198a 100644
  }
  
  /* Live native-wide vs squash toggle (ws_nw TCP command) for A/B comparison.
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 52c57bca..134c5d8a 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -50,6 +50,7 @@ enum {
+     PGXP_F_VX = 1u << 0,   /* low half  (screen X) tracked                    */
+     PGXP_F_VY = 1u << 1,   /* high half (screen Y) tracked                    */
+     PGXP_F_VZ = 1u << 2,   /* projected depth rode along intact               */
++    PGXP_F_VM = 1u << 3,   /* previous-frame screen position (motion) valid    */
+     PGXP_F_VXY = PGXP_F_VX | PGXP_F_VY,
+ };
+ 
+@@ -59,6 +60,8 @@ struct PGXPValue {
+     uint16_t flags;
+     uint32_t value;      /* the guest word this shadow describes              */
+     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
++    int32_t  mx16, my16; /* motion: screen position minus the previous game
++                          * frame's, 16.16 (valid iff PGXP_F_VM)              */
+ };
+ 
+ #define PGXP_RAM_WORDS     (0x200000u >> 2)   /* 2 MB RAM                     */
+@@ -651,6 +654,15 @@ extern "C" void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
+     s_gte[15] = *pv;                           /* SXYP mirrors SXY2           */
+ }
+ 
++extern "C" void pgxp_gte_set_motion(int32_t mx16, int32_t my16) {
++    if (!g_pgxp_active) return;
++    PGXPValue *pv = &s_gte[14];                /* the value just pushed       */
++    pv->mx16 = mx16;
++    pv->my16 = my16;
++    pv->flags = (uint16_t)(pv->flags | PGXP_F_VM);
++    s_gte[15] = *pv;
++}
++
+ extern "C" int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16) {
+     return pgxp_get_gte_sxy_checked(index, 0u, 0, x16, y16);
+ }
+@@ -683,6 +695,18 @@ extern "C" void pgxp_gte_reg_written(int reg, uint32_t value) {
+ /* GPU consumer                                                               */
+ /* ------------------------------------------------------------------------- */
+ 
++extern "C" int pgxp_get_motion_vertex(uint32_t addr, uint32_t packet_word,
++                                      int32_t *mx16, int32_t *my16) {
++    if (!s_enabled || addr == 0xFFFFFFFFu) return 0;
++    const PGXPValue *pv = pgxp_ptr(addr);
++    if (!pv || pv->gen != s_gen || pv->value != packet_word ||
++        (pv->flags & PGXP_F_VM) == 0)
++        return 0;
++    *mx16 = pv->mx16;
++    *my16 = pv->my16;
++    return 1;
++}
++
+ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                                        int32_t int_x, int32_t int_y,
+                                        int32_t *x16, int32_t *y16,
