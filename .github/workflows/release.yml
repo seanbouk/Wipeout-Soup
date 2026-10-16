@@ -25,7 +25,7 @@ jobs:
             zip curl git
       - name: Apply framework changes
         shell: bash
-        run: git -c core.autocrlf=true -C psxrecomp apply ../patches/psxrecomp.patch
+        run: git -c core.autocrlf=true -C psxrecomp apply ../patches/psxrecomp.patch ../patches/psxrecomp-soup.patch
       - name: Build emitters and setup host
         run: |
           set -euo pipefail

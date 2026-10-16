@@ -35,7 +35,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
       - name: Apply framework changes
-        run: git -C psxrecomp apply ../patches/psxrecomp.patch
+        run: git -C psxrecomp apply ../patches/psxrecomp.patch ../patches/psxrecomp-soup.patch
       - name: Build native emitters and setup host
         run: |
           set -euo pipefail

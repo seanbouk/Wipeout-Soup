@@ -1,3 +1,14 @@
+# Wipeout Soup
+
+> **Fork of [NJH-1001/Wipeout2K97XL](https://github.com/NJH-1001/Wipeout2K97XL).**
+> All credit for the recompilation project goes to its author. This fork adds
+> experiments on top: ultrawide aspect choices in the widescreen mod, plus
+> `patches/psxrecomp-soup.patch`, which carries framework fixes that let the
+> retail SCPH-1001 BIOS boot (see
+> [docs/upstream/psxrecomp-scph1001-issue.md](docs/upstream/psxrecomp-scph1001-issue.md)).
+> The rest of this README is upstream's. Report problems with the fork's
+> changes here, not upstream.
+
 # Wipeout XL Recompiled — Wipeout2K97XL
 
 An unofficial PSXRecomp compatibility project for **Wipeout XL (USA), SCUS-94351**.
@@ -107,9 +118,9 @@ This project is not affiliated with Sony, Psygnosis or the game's rights holders
 ## Building from repository source
 
 ```sh
-git clone --recurse-submodules https://github.com/NJH-1001/Wipeout2K97XL.git
-cd Wipeout2K97XL
-git -C psxrecomp apply ../patches/psxrecomp.patch
+git clone --recurse-submodules https://github.com/seanbouk/Wipeout-Soup.git
+cd Wipeout-Soup
+git -C psxrecomp apply ../patches/psxrecomp.patch ../patches/psxrecomp-soup.patch
 python psxrecomp/psxrecomp_cli.py generate --project-root . --config game.toml --disc "/path/to/Wipeout XL (USA).cue"
 python psxrecomp/psxrecomp_cli.py rebuild --project-root . --config game.toml --build-dir build-release --target psx-runtime --exe-basename Wipeout2K97XL --no-pgo
 ```

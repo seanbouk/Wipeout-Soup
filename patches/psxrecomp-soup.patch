@@ -1,0 +1,466 @@
+diff --git a/recompiler/seeds/phase2_ghidra_seeds.json b/recompiler/seeds/phase2_ghidra_seeds.json
+index 821c68e8..d2038f96 100644
+--- a/recompiler/seeds/phase2_ghidra_seeds.json
++++ b/recompiler/seeds/phase2_ghidra_seeds.json
+@@ -1,7 +1,7 @@
+ {
+   "schema": "psxrecomp phase2 seeds",
+   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
+-  "seed_count": 1072,
++  "seed_count": 1185,
+   "seeds": [
+     {
+       "address": "0xBFC00000",
+@@ -5436,6 +5436,421 @@
+     {
+       "address": "0xBFC0D4F0",
+       "rationale": "kernel jump-table target: A0:B4 (GetSystemInfo-family) \u2014 ROM-resident entry of the post-init A0/B0/C0 tables (read from live kernel RAM 0x200/0x874/0x674); reachable only through the vector table, invisible to transitive discovery. Class found via MMX6 card-check: A0:2B memset dispatch-missed silently, killing the save-scan (2026-07-02)."
++    },
++    {
++      "address": "0xBFC04F58",
++      "label": "xfn_gap_BFC04F58",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC04F68",
++      "label": "xfn_gap_BFC04F68",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC04F78",
++      "label": "xfn_gap_BFC04F78",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC04F88",
++      "label": "xfn_gap_BFC04F88",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0B7F4",
++      "label": "xfn_gap_BFC0B7F4",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0B954",
++      "label": "xfn_gap_BFC0B954",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0BA38",
++      "label": "xfn_gap_BFC0BA38",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0BA44",
++      "label": "xfn_gap_BFC0BA44",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0BAA0",
++      "label": "xfn_gap_BFC0BAA0",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0D534",
++      "label": "xfn_gap_BFC0D534",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0D540",
++      "label": "xfn_gap_BFC0D540",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC0D54C",
++      "label": "xfn_gap_BFC0D54C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC11598",
++      "label": "xfn_gap_BFC11598",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC115AC",
++      "label": "xfn_gap_BFC115AC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14DC4",
++      "label": "xfn_gap_BFC14DC4",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14DF8",
++      "label": "xfn_gap_BFC14DF8",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14E98",
++      "label": "xfn_gap_BFC14E98",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14ED4",
++      "label": "xfn_gap_BFC14ED4",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14F2C",
++      "label": "xfn_gap_BFC14F2C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14F88",
++      "label": "xfn_gap_BFC14F88",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14FCC",
++      "label": "xfn_gap_BFC14FCC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC14FFC",
++      "label": "xfn_gap_BFC14FFC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC15038",
++      "label": "xfn_gap_BFC15038",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC162B8",
++      "label": "xfn_gap_BFC162B8",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC16370",
++      "label": "xfn_gap_BFC16370",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC16428",
++      "label": "xfn_gap_BFC16428",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1A67C",
++      "label": "xfn_gap_BFC1A67C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1A68C",
++      "label": "xfn_gap_BFC1A68C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1A69C",
++      "label": "xfn_gap_BFC1A69C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1A6AC",
++      "label": "xfn_gap_BFC1A6AC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1A6BC",
++      "label": "xfn_gap_BFC1A6BC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1A6CC",
++      "label": "xfn_gap_BFC1A6CC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1ACC4",
++      "label": "xfn_gap_BFC1ACC4",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1ACCC",
++      "label": "xfn_gap_BFC1ACCC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1ACD4",
++      "label": "xfn_gap_BFC1ACD4",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1BE24",
++      "label": "xfn_gap_BFC1BE24",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1BE88",
++      "label": "xfn_gap_BFC1BE88",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1BE98",
++      "label": "xfn_gap_BFC1BE98",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1BEC0",
++      "label": "xfn_gap_BFC1BEC0",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1D000",
++      "label": "xfn_gap_BFC1D000",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1D244",
++      "label": "xfn_gap_BFC1D244",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1D628",
++      "label": "xfn_gap_BFC1D628",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1D824",
++      "label": "xfn_gap_BFC1D824",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E218",
++      "label": "xfn_gap_BFC1E218",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E260",
++      "label": "xfn_gap_BFC1E260",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E28C",
++      "label": "xfn_gap_BFC1E28C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E2B8",
++      "label": "xfn_gap_BFC1E2B8",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E2D0",
++      "label": "xfn_gap_BFC1E2D0",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E2E0",
++      "label": "xfn_gap_BFC1E2E0",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E308",
++      "label": "xfn_gap_BFC1E308",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E31C",
++      "label": "xfn_gap_BFC1E31C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E32C",
++      "label": "xfn_gap_BFC1E32C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E344",
++      "label": "xfn_gap_BFC1E344",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E358",
++      "label": "xfn_gap_BFC1E358",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E374",
++      "label": "xfn_gap_BFC1E374",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E384",
++      "label": "xfn_gap_BFC1E384",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E398",
++      "label": "xfn_gap_BFC1E398",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E450",
++      "label": "xfn_gap_BFC1E450",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E47C",
++      "label": "xfn_gap_BFC1E47C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E48C",
++      "label": "xfn_gap_BFC1E48C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E538",
++      "label": "xfn_gap_BFC1E538",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E548",
++      "label": "xfn_gap_BFC1E548",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E558",
++      "label": "xfn_gap_BFC1E558",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E568",
++      "label": "xfn_gap_BFC1E568",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC27F10",
++      "label": "xfn_gap_BFC27F10",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC27F30",
++      "label": "xfn_gap_BFC27F30",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC27F50",
++      "label": "xfn_gap_BFC27F50",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC27F70",
++      "label": "xfn_gap_BFC27F70",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC27F90",
++      "label": "xfn_gap_BFC27F90",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC2AE18",
++      "label": "xfn_gap_BFC2AE18",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC2AED0",
++      "label": "xfn_gap_BFC2AED0",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC2AF88",
++      "label": "xfn_gap_BFC2AF88",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC34DC8",
++      "label": "xfn_gap_BFC34DC8",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC34DF0",
++      "label": "xfn_gap_BFC34DF0",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC36DA8",
++      "label": "xfn_gap_BFC36DA8",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC4054C",
++      "label": "xfn_gap_BFC4054C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC40564",
++      "label": "xfn_gap_BFC40564",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC4057C",
++      "label": "xfn_gap_BFC4057C",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC40594",
++      "label": "xfn_gap_BFC40594",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (jump-table/branch target); runtime FAIL-FAST seen at 0xBFC04F68"
++    },
++    {
++      "address": "0xBFC1E4EC",
++      "label": "xfn_gap_BFC1E4EC",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (iterated closure)"
++    },
++    {
++      "address": "0xBFC1E508",
++      "label": "xfn_gap_BFC1E508",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (iterated closure)"
++    },
++    {
++      "address": "0xBFC1E518",
++      "label": "xfn_gap_BFC1E518",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (iterated closure)"
++    },
++    {
++      "address": "0xBFC1E528",
++      "label": "xfn_gap_BFC1E528",
++      "rationale": "psxrecomp-bios cross-function target in no emitted function (iterated closure)"
+     }
+   ],
+   "excluded": [
+@@ -5445,4 +5860,4 @@
+       "rationale": "R3000 UTLB-miss vector; PS1 has no TLB; never executed"
+     }
+   ]
+-}
+\ No newline at end of file
++}
+diff --git a/recompiler/src/main_bios.cpp b/recompiler/src/main_bios.cpp
+index 5417b288..08fb32de 100644
+--- a/recompiler/src/main_bios.cpp
++++ b/recompiler/src/main_bios.cpp
+@@ -844,7 +844,18 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
+     write_file(out_dir / "function_edges.json", make_function_edges_json(dr));
+     write_file(out_dir / "indirect_jumps.json", make_indirect_jumps_json(dr));
+     write_file(out_dir / "indirect_jump_classes.json", make_indirect_jump_classes_json(dr));
+-    if (!dr.ok) {
++    // Retail images carry dead FPU (COP1) code — SCPH-1001's number parser at
++    // 0xBFC02324 — which the PS1 cannot execute (no COP1). Only that class is
++    // admitted: the emitter skips those functions and gives them fatal
++    // diagnostic stubs, so a call aborts loudly. Anything else still fails.
++    bool only_cop1 = !dr.unsupported.empty();
++    for (const auto& u : dr.unsupported)
++        if ((u.raw >> 26) != 0x11u) only_cop1 = false;
++    if (!dr.ok && only_cop1) {
++        std::cout << "psxrecomp-bios: WARNING: " << dr.unsupported.size()
++                  << " COP1 (FPU) instructions; their functions will be skipped "
++                     "with fatal stubs. See unsupported_ops.json.\n";
++    } else if (!dr.ok) {
+         std::cout << "psxrecomp-bios: DISCOVERY FAILED: " << dr.unsupported.size()
+                   << " unsupported instructions; see unsupported_ops.json. "
+                      "No C emitted.\n";
