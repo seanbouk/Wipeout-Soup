@@ -465,10 +465,10 @@ index 5417b288..08fb32de 100644
                    << " unsupported instructions; see unsupported_ops.json. "
                       "No C emitted.\n";
 diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
-index 83d53858..82e50afe 100644
+index 83d53858..7f80907b 100644
 --- a/runtime/include/gpu_gl_renderer.h
 +++ b/runtime/include/gpu_gl_renderer.h
-@@ -138,6 +138,32 @@ int  gl_renderer_get_scanlines(float *strength);
+@@ -138,6 +138,42 @@ int  gl_renderer_get_scanlines(float *strength);
   * path. Textured edge expansion needs the complete mirror surface. */
  void gl_renderer_set_wide_fast(int on);
  
@@ -490,6 +490,16 @@ index 83d53858..82e50afe 100644
 + * start. The status string is "opengl" or the presenter's own status. */
 +void gl_renderer_set_vulkan_presenter(int on);
 +const char *gl_renderer_presenter_status(void);
++/* DLSS Super Resolution / DLAA through the Vulkan presenter (NVIDIA
++ * Streamline). Needs the Vulkan presenter, scene depth and motion output; set
++ * before the renderer initialises. Turns on per-render sub-pixel jitter while
++ * DLSS is actually running. */
++void gl_renderer_set_dlss(int on);
++const char *gl_renderer_dlss_status(void);
++/* Debug: sign of the jitter handed to DLSS (+1/-1 per axis). */
++void gl_renderer_dlss_jitter_sign(int sx, int sy);
++/* Per-render sub-pixel jitter for a temporal upscaler (3D prims only). */
++void gl_renderer_set_upscaler_jitter(int on);
 +int  gl_renderer_get_motion_output(void);
 +/* Debug: write the next `count` presented frames' colour (RGBA8) and motion
 + * (RGBA float: xy = native-pixel motion, z = written flag) into dir as
@@ -502,10 +512,10 @@ index 83d53858..82e50afe 100644
  
  /* Diagnostics (debug server): read GPU-side VRAM without touching the CPU
 diff --git a/runtime/include/gpu_render.h b/runtime/include/gpu_render.h
-index ace31f11..87d52103 100644
+index ace31f11..90da8ea7 100644
 --- a/runtime/include/gpu_render.h
 +++ b/runtime/include/gpu_render.h
-@@ -54,6 +54,15 @@ void gr_set_precise_triangle(int enabled,
+@@ -54,6 +54,18 @@ void gr_set_precise_triangle(int enabled,
   * perspective_texturing). q[i] is the normalized 1/z homogeneous weight at
   * vertex i. enabled == 0 restores the PS1's affine UV interpolation. */
  void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
@@ -518,24 +528,28 @@ index ace31f11..87d52103 100644
 + * current minus previous screen position, 16.16 native pixels (motion
 + * vectors). valid == 0 means no motion for this prim. Presentation only. */
 +void gr_set_triangle_motion(int valid, const int32_t dx16[3], const int32_t dy16[3]);
++/* The game flipped its display buffer: the next draws belong to a new render
++ * (temporal upscaler bookkeeping, e.g. per-render jitter). */
++void gr_begin_render(void);
  
  /* Primitives */
  void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
-@@ -142,6 +151,8 @@ typedef struct GpuRenderBackend {
+@@ -142,6 +154,9 @@ typedef struct GpuRenderBackend {
                                   int32_t x1, int32_t y1,
                                   int32_t x2, int32_t y2);
      void (*set_perspective_triangle)(int enabled, float q0, float q1, float q2);
 +    void (*set_triangle_depth)(int valid, uint16_t z0, uint16_t z1, uint16_t z2);
 +    void (*set_triangle_motion)(int valid, const int32_t dx16[3], const int32_t dy16[3]);
++    void (*begin_render)(void);
      void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
      void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
      void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,
 diff --git a/runtime/include/motion_vectors.h b/runtime/include/motion_vectors.h
 new file mode 100644
-index 00000000..9c4cdcb1
+index 00000000..e73a895d
 --- /dev/null
 +++ b/runtime/include/motion_vectors.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,44 @@
 +/* Motion vectors (presentation only): previous-game-frame screen positions
 + * for projected vertices, from the game's camera. Implemented in gte.cpp;
 + * the GL renderer turns them into a per-pixel motion target. See
@@ -568,6 +582,8 @@ index 00000000..9c4cdcb1
 + * a camera cut, the first 3D after menus/FMV, or motion just enabled.
 + * (DLSS-style "reset" for the frame on screen.) */
 +int psx_mv_last_render_was_reset(void);
++/* The render being drawn right now has no motion history. */
++int psx_mv_current_render_is_reset(void);
 +/* Renders seen by psx_mv_render_boundary that had 3D. */
 +unsigned long long psx_mv_frame_count(void);
 +/* Debug: comma-separated JSON fields (no braces). */
@@ -605,12 +621,76 @@ index aa55b3aa..662a2906 100644
  
  /* --- observability -------------------------------------------------------- */
  
+diff --git a/runtime/include/sl_bridge.h b/runtime/include/sl_bridge.h
+new file mode 100644
+index 00000000..656cda04
+--- /dev/null
++++ b/runtime/include/sl_bridge.h
+@@ -0,0 +1,58 @@
++/* NVIDIA Streamline bridge for the Vulkan presenter (DLSS Super Resolution).
++ * C interface over the C++ Streamline headers; Streamline itself
++ * (sl.interposer.dll and its plugins) is loaded at runtime from the exe's
++ * folder. Windows + PSX_STREAMLINE builds only; elsewhere everything is inert. */
++#ifndef PSX_SL_BRIDGE_H
++#define PSX_SL_BRIDGE_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* A Vulkan image as Streamline needs it described (all Vulkan handles are
++ * passed as void* so this header needs no Vulkan include). */
++typedef struct SlbImage {
++    void *image;          /* VkImage      */
++    void *view;           /* VkImageView  */
++    uint32_t format;      /* VkFormat     */
++    uint32_t layout;      /* VkImageLayout the image is in when DLSS runs */
++    uint32_t usage;       /* VkImageUsageFlags */
++    uint32_t width, height;
++} SlbImage;
++
++typedef struct SlbFrame {
++    SlbImage color, depth, mvec, output;
++    uint32_t in_x, in_y, in_w, in_h;    /* active input rectangle (render pixels)  */
++    uint32_t out_w, out_h;              /* output size (pixels)                    */
++    float jitter_x, jitter_y;           /* render-pixel jitter of this frame       */
++    float mvec_scale_x, mvec_scale_y;   /* raw mvec * scale = normalised motion    */
++    int reset;                          /* no history: camera cut etc.             */
++    uint32_t frame_index;
++} SlbFrame;
++
++/* Load sl.interposer.dll and slInit (Vulkan, DLSS). Must run before the
++ * Vulkan instance/device are created. Returns 1 on success. */
++int slb_load(void);
++/* Streamline's vkGetInstanceProcAddr: create the instance and device through
++ * it so Streamline can add what DLSS needs and see each present. */
++void *slb_vk_get_instance_proc_addr(void);
++/* After vkCreateDevice: check DLSS support on this GPU, fetch DLSS entry
++ * points. Returns 1 if DLSS can run. */
++int slb_device_ready(void *vk_instance, void *vk_physical_device, void *vk_device);
++/* Configure DLSS for this input/output size (picks the mode from the ratio:
++ * DLAA when equal). Returns the sl::DLSSMode used, or 0 if this combination
++ * can't run (e.g. output smaller than input). Cheap when unchanged. */
++int slb_dlss_configure(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h);
++/* Record DLSS into cmd (a VkCommandBuffer). Returns 1 on success. */
++int slb_dlss_evaluate(void *cmd, const SlbFrame *f);
++void slb_shutdown(void);
++/* Debug: last status / error. */
++const char *slb_status(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
 diff --git a/runtime/include/vk_presenter.h b/runtime/include/vk_presenter.h
 new file mode 100644
-index 00000000..d3e57863
+index 00000000..0bd3f6c2
 --- /dev/null
 +++ b/runtime/include/vk_presenter.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,74 @@
 +/* Vulkan presenter for the OpenGL renderer (Wipeout Soup Phase 4a).
 + *
 + * The GL renderer keeps rendering exactly as before, but its final present
@@ -655,25 +735,51 @@ index 00000000..d3e57863
 +/* Debug: one-line status ("off", or device/mode/size). */
 +const char *vkp_status(void);
 +
++/* ---- DLSS Super Resolution / DLAA (NVIDIA Streamline) ----
++ * Request before vkp_prepare/vkp_init: the Vulkan instance is then created
++ * through Streamline. If Streamline or DLSS is unavailable the presenter
++ * still runs, without DLSS. */
++void vkp_set_dlss(int on);
++/* Size the DLSS inputs (render pixels) and output (the letterbox rectangle,
++ * window pixels). Returns the DLSS mode in use (sl::DLSSMode, DLAA when the
++ * sizes match), or 0 when DLSS can't run for these sizes. GL context current. */
++int vkp_dlss_configure(int in_w, int in_h, int out_w, int out_h);
++/* GL framebuffer holding the DLSS inputs: COLOR0 colour (RGBA8), COLOR1 motion
++ * (RGBA16F, xy), depth-stencil D24S8. All top-down (row 0 = top of screen). */
++unsigned vkp_dlss_input_fbo(void);
++typedef struct VkpDlssFrame {
++    unsigned render_id;                 /* game render shown; DLSS runs once per render */
++    float jitter_x, jitter_y;           /* that render's sub-pixel jitter (render px)   */
++    float mvec_scale_x, mvec_scale_y;   /* raw motion * scale = normalised prev - cur   */
++    int reset;                          /* no history (cut)                             */
++    int lx, ly, lw, lh;                 /* letterbox rect in the window (GL, bottom-up) */
++} VkpDlssFrame;
++/* With the inputs written: run DLSS (or reuse the last output for a repeated
++ * render) and put the result into the window image's letterbox rectangle.
++ * Call before drawing the OSD. Returns 1 if the DLSS image was placed. */
++int vkp_dlss_run(const VkpDlssFrame *f);
++const char *vkp_dlss_status(void);
++
 +#ifdef __cplusplus
 +}
 +#endif
 +
 +#endif
 diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
-index 96be1f85..7c08b411 100644
+index 96be1f85..ed1ecec1 100644
 --- a/runtime/runtime.cmake
 +++ b/runtime/runtime.cmake
-@@ -318,6 +318,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+@@ -318,6 +318,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
      ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
      ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
      ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
 +    ${PSXRECOMP_ROOT}/runtime/src/vk_presenter.c
++    ${PSXRECOMP_ROOT}/runtime/src/sl_bridge.cpp
      ${PSXRECOMP_ROOT}/runtime/src/dma_gpu_ll.c
      ${PSXRECOMP_ROOT}/runtime/src/dma.c
      ${PSXRECOMP_ROOT}/runtime/src/mdec.c
 diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
-index 1c7bcd72..4b50113f 100644
+index 1c7bcd72..931295ee 100644
 --- a/runtime/src/debug_server.c
 +++ b/runtime/src/debug_server.c
 @@ -6301,18 +6301,21 @@ static void handle_gte_ring_dump(int id, const char *json)
@@ -711,7 +817,7 @@ index 1c7bcd72..4b50113f 100644
      if (!present_shot_request(path)) {
          send_err(id, "present_shot unavailable (headless, or the Vulkan backend "
                       "which has no present readback)");
-@@ -8991,6 +8998,40 @@ static void handle_present_shot(int id, const char *json)
+@@ -8991,6 +8998,57 @@ static void handle_present_shot(int id, const char *json)
               id, path, present_shot_seq());
  }
  
@@ -731,6 +837,23 @@ index 1c7bcd72..4b50113f 100644
 +    send_fmt("{\"id\":%d,\"ok\":true,%s,%s,\"renderer\":%d,\"capture_left\":%d}",
 +             id, body, gpu, gl_renderer_get_motion_output(), gl_renderer_mv_capture_left());
 +}
++/* dlss — DLSS status; optional "jx"/"jy" (+1/-1) set the jitter sign handed
++ * to DLSS (for checking the convention); "on" 0/1 switches DLSS off/on at
++ * runtime for A/B checks (only if it was enabled at start). */
++static void handle_dlss(int id, const char *json)
++{
++    extern const char *gl_renderer_dlss_status(void);
++    extern void gl_renderer_dlss_jitter_sign(int sx, int sy);
++    int jx = json_get_int(json, "jx", 0), jy = json_get_int(json, "jy", 0);
++    if (jx || jy) gl_renderer_dlss_jitter_sign(jx ? jx : 1, jy ? jy : 1);
++    int on = json_get_int(json, "on", -1);
++    if (on >= 0) {
++        extern void gl_renderer_dlss_runtime(int on);
++        gl_renderer_dlss_runtime(on);
++    }
++    send_fmt("{\"id\":%d,\"ok\":true,\"dlss\":\"%s\"}", id, gl_renderer_dlss_status());
++}
++
 +/* presenter — which presenter is live ("opengl" or the Vulkan presenter's
 + * device / present mode / size). */
 +static void handle_presenter(int id, const char *json)
@@ -752,18 +875,19 @@ index 1c7bcd72..4b50113f 100644
  /* present_shot_seq — completion counter for the staged capture above. Sample it
   * before present_shot and poll until it changes; the counter advances on every
   * completion, success or not, so the poll always terminates. `wrote` reports
-@@ -13887,6 +13928,9 @@ static const CmdEntry s_commands[] = {
+@@ -13887,6 +13945,10 @@ static const CmdEntry s_commands[] = {
      { "screenshot_file",   handle_screenshot_file },
      { "screenshot_hires",  handle_screenshot_hires },
      { "present_shot",      handle_present_shot },
 +    { "mv_stats",          handle_mv_stats },
 +    { "mv_capture",        handle_mv_capture },
 +    { "presenter",         handle_presenter },
++    { "dlss",              handle_dlss },
      { "present_shot_seq",  handle_present_shot_seq },
      { "display_ring_get",  handle_display_ring_get },
      { "display_ring_aux",  handle_display_ring_aux },
 diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
-index 41490964..db025627 100644
+index 41490964..9a40c372 100644
 --- a/runtime/src/gpu.c
 +++ b/runtime/src/gpu.c
 @@ -3393,9 +3393,22 @@ uint32_t gpu_texture_correction_hits(void) {
@@ -846,7 +970,7 @@ index 41490964..db025627 100644
  }
  
  /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
-@@ -5699,9 +5731,15 @@ static void gp1_display_area_start(uint32_t val) {
+@@ -5699,9 +5731,16 @@ static void gp1_display_area_start(uint32_t val) {
      /* GP1(05h): Start of display area in VRAM
       * bits 0-9: X (in halfwords, 0-1023)
       * bits 10-18: Y (0-511) */
@@ -858,12 +982,13 @@ index 41490964..db025627 100644
 +    if (display_area_x != prev_x || display_area_y != prev_y) {
 +        extern void psx_mv_render_boundary(void);
 +        psx_mv_render_boundary();
++        gr_begin_render();
 +    }
  }
  
  static void gp1_h_display_range(uint32_t val) {
 diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
-index 2bb0e9f6..94535040 100644
+index 2bb0e9f6..fb90d816 100644
 --- a/runtime/src/gpu_gl_renderer.c
 +++ b/runtime/src/gpu_gl_renderer.c
 @@ -86,7 +86,8 @@
@@ -910,7 +1035,7 @@ index 2bb0e9f6..94535040 100644
      LOAD(p_glGenRenderbuffers, "glGenRenderbuffers");
      LOAD(p_glDeleteRenderbuffers, "glDeleteRenderbuffers");
      LOAD(p_glBindRenderbuffer, "glBindRenderbuffer");
-@@ -304,6 +311,13 @@ static SDL_Window   *s_win = NULL;
+@@ -304,6 +311,15 @@ static SDL_Window   *s_win = NULL;
  static SDL_GLContext s_ctx = NULL;
  static uint16_t     *s_vram = NULL;       /* CPU VRAM array (gpu.c's storage) */
  static int           s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) */
@@ -921,10 +1046,12 @@ index 2bb0e9f6..94535040 100644
 + * unchanged when it is 0. */
 +static GLuint        s_win_fbo = 0;
 +static int           s_vkp_want = 0, s_vkp_on = 0;
++static int           s_dlss_want = 0;                 /* DLSS through the Vulkan presenter */
++static int           s_dlss_jsign_x = 1, s_dlss_jsign_y = 1;   /* jitter sign handed to DLSS (debug) */
  
  static int           s_scale = 1;          /* internal-res scale (hr FBO) */
  /* Netplay: SW@1× + GPU@s_scale dual write; CPU VRAM always authoritative. */
-@@ -373,8 +387,12 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+@@ -373,8 +389,12 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
   * q is the perspective weight ([video] perspective_texturing): 0 = affine, the
   * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
   * fragment shader read the noperspective varying — i.e. bit-identical to the
@@ -939,7 +1066,7 @@ index 2bb0e9f6..94535040 100644
  static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
  static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
  
-@@ -387,6 +405,34 @@ static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  *
+@@ -387,6 +407,50 @@ static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  *
  static int     s_pq_valid = 0;                  /* perspective weights present */
  static float   s_pq[3];
  
@@ -963,18 +1090,34 @@ index 2bb0e9f6..94535040 100644
 + * triangles PGXP gave a previous-frame position draw motion, written by an
 + * extra pass per opaque batch into a second colour attachment (RGBA16F:
 + * xy = current - previous position in native pixels, z = 1 where written).
-+ * Semi-transparent prims leave the motion underneath. Fills clear it. Off,
++ * Opaque prims with neither depth nor motion (2D: HUD, text, sprites) write
++ * zero motion, so upscalers don't drag the HUD along with the scenery under
++ * it; 3D prims PGXP couldn't give motion to, and semi-transparent prims,
++ * leave the motion underneath. Fills clear it. Off,
 + * nothing is allocated or drawn. */
 +static int     s_mv_out = 0;
 +static int     s_pm_valid = 0;                  /* motion for the next triangle */
 +static float   s_pm_dx[3], s_pm_dy[3];          /* motion delta, native px      */
 +static GLuint  s_mv_tex = 0;                    /* hr motion target             */
++
++/* Temporal upscaler (DLSS) bookkeeping. Jitter is a Halton(2,3) sub-pixel
++ * offset applied to 3D prims only (prims with scene depth; 2D/HUD stays put),
++ * changed once per render. Each display buffer remembers the render that was
++ * last drawn into it, that render's jitter and whether it began a new motion
++ * history, so presenting a buffer hands the upscaler the right metadata even
++ * though the display lags the draw. Off unless the presenter runs DLSS. */
++static int      s_jitter_on = 0;
++static uint32_t s_render_id = 0;                /* bumped at each display flip  */
++static float    s_jit_x = 0.f, s_jit_y = 0.f;   /* this render, render pixels   */
++static GLint    s_geo_uJitter = -1, s_tex_uJitter = -1;
++struct UpscaleBuf { int used, x, y; uint32_t render; float jx, jy; int reset; };
++static struct UpscaleBuf s_ubuf[4];
 +static GLint   s_uTexMv = -1, s_uGeoMv = -1;    /* u_mvpass                     */
 +
  /* TEX program uniforms. */
  static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
  static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
-@@ -502,6 +548,7 @@ static int s_stencil_valid = 1;
+@@ -502,6 +566,7 @@ static int s_stencil_valid = 1;
  #define WIDE_MAX_SURF 4
  static GLuint s_wide_tex[WIDE_MAX_SURF];     /* color tex per surface (0 = free) */
  static GLuint s_wide_fbo[WIDE_MAX_SURF];     /* FBO per surface */
@@ -982,7 +1125,7 @@ index 2bb0e9f6..94535040 100644
  static GLuint s_wide_rb[WIDE_MAX_SURF];      /* depth-stencil RB per surface (mask
                                                * mirror, same as hr). PERF-CRITICAL:
                                                * a stencil-less wide FBO made every
-@@ -720,7 +767,7 @@ static void hold_ensure_tex(int w, int h) {
+@@ -720,7 +785,7 @@ static void hold_ensure_tex(int w, int h) {
      p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hold_fbo);
      p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0,
                               GL_TEXTURE_2D, s_hold_tex, 0);
@@ -991,7 +1134,7 @@ index 2bb0e9f6..94535040 100644
      s_hold_tw = w;
      s_hold_th = h;
  }
-@@ -735,7 +782,7 @@ static void hold_capture_drawable(void) {
+@@ -735,7 +800,7 @@ static void hold_capture_drawable(void) {
      if (ww < 1 || wh < 1)
          return;
      hold_ensure_tex(ww, wh);
@@ -1000,7 +1143,7 @@ index 2bb0e9f6..94535040 100644
      glBindTexture(GL_TEXTURE_2D, s_hold_tex);
      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, ww, wh);
      glBindTexture(GL_TEXTURE_2D, 0);
-@@ -758,8 +805,8 @@ static void hold_capture_native_fbo(GLuint src_fbo, int dx, int dy, int dw, int
+@@ -758,8 +823,8 @@ static void hold_capture_native_fbo(GLuint src_fbo, int dx, int dy, int dw, int
      p_glBlitFramebuffer(dx * S, dy * S, (dx + dw) * S, (dy + dh) * S,
                          0, 0, dw * S, dh * S,
                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -1011,7 +1154,7 @@ index 2bb0e9f6..94535040 100644
      s_hold_kind = HOLD_NATIVE;
      s_hold_force_4_3 = force_4_3 ? 1 : 0;
      s_hold_linear = linear ? 1 : 0;
-@@ -845,7 +892,7 @@ static void pres_record(int path, int dx, int dy, int w, int h,
+@@ -845,7 +910,7 @@ static void pres_record(int path, int dx, int dy, int w, int h,
          glReadPixels((dx + w / 2) * s_scale, (dy + h / 2) * s_scale,
                       1, 1, GL_RGB, GL_UNSIGNED_BYTE, sp);
          glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -1020,13 +1163,14 @@ index 2bb0e9f6..94535040 100644
          e->src_valid = 1;
      }
      e->src_r = sp[0]; e->src_g = sp[1]; e->src_b = sp[2];
-@@ -1020,24 +1067,30 @@ static const char *GEO_VS =
+@@ -1020,24 +1085,32 @@ static const char *GEO_VS =
      "#version 330\n"
      "layout(location=0) in vec2 a_pos;\n"
      "layout(location=1) in vec4 a_col;\n"
 +    "layout(location=2) in float a_z;   /* scene depth 0..1; 0.5 = none */\n"
 +    "layout(location=3) in vec2 a_prev; /* previous-frame position (motion) */\n"
      "uniform float u_shift;\n"
++    "uniform vec2 u_jitter;  /* upscaler sub-pixel jitter, native px (3D prims only) */\n"
      "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
      "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
      "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
@@ -1046,7 +1190,8 @@ index 2bb0e9f6..94535040 100644
 +    "void main(){ v_col = a_col;\n"
 +    "  float xb = wide_x(a_pos.x);\n"
 +    "  v_mv = vec2(xb - wide_x(a_prev.x), a_pos.y - a_prev.y);\n"
-+    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, a_z*2.0 - 1.0, 1.0); }\n";
++    "  vec2 jit = (a_z != 0.5) ? u_jitter : vec2(0.0);\n"
++    "  gl_Position = vec4((xb+jit.x+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+jit.y+u_shift)/256.0 - 1.0, a_z*2.0 - 1.0, 1.0); }\n";
  static const char *GEO_FS =
      "#version 330\n"
 -    "noperspective in vec4 v_col; out vec4 frag;\n"
@@ -1057,16 +1202,18 @@ index 2bb0e9f6..94535040 100644
  
  /* Textured prims: sample raw 1555 VRAM (integer), CLUT decode per depth,
   * texture window, optional bilinear, texel-0 discard, STP-split discard,
-@@ -1062,6 +1115,8 @@ static const char *TEX_VS =
+@@ -1062,7 +1135,10 @@ static const char *TEX_VS =
      "layout(location=7) in vec4 a_limits;\n"
      "layout(location=8) in float a_semi;\n"
      "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
 +    "layout(location=10) in float a_z;  /* scene depth 0..1; 0.5 = none */\n"
 +    "layout(location=11) in vec2 a_prev; /* previous-frame position (motion) */\n"
      "uniform float u_shift;\n"
++    "uniform vec2 u_jitter;  /* upscaler sub-pixel jitter, native px (3D prims only) */\n"
      "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
      "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
-@@ -1072,6 +1127,14 @@ static const char *TEX_VS =
+     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
+@@ -1072,6 +1148,14 @@ static const char *TEX_VS =
      "flat out int v_persp;\n"
      "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
      "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
@@ -1081,7 +1228,7 @@ index 2bb0e9f6..94535040 100644
      "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
      "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
      "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
-@@ -1080,19 +1143,17 @@ static const char *TEX_VS =
+@@ -1080,19 +1164,18 @@ static const char *TEX_VS =
      "  v_limits = ivec4(floor(a_limits + 0.5));\n"
      "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
      "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
@@ -1098,15 +1245,17 @@ index 2bb0e9f6..94535040 100644
      "   * the rasterizer interpolates the smooth varying hyperbolically. With\n"
      "   * a_q == 0 (feature off) w is exactly 1.0 and this is the old expression. */\n"
      "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
-     "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
+-    "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
 -    "  gl_Position = vec4(ndc * w, 0.0, w); }\n";
++    "  vec2 jit = (a_z != 0.5) ? u_jitter : vec2(0.0);\n"
++    "  vec2 ndc = vec2((xb+jit.x+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+jit.y+u_shift)/256.0 - 1.0);\n"
 +    "  /* Depth is affine in 1/z, which is screen-linear, so pre-multiplying by\n"
 +    "   * w makes the rasterizer's screen-linear depth exact. */\n"
 +    "  gl_Position = vec4(ndc * w, (a_z*2.0 - 1.0) * w, w); }\n";
  static const char *TEX_FS =
      "#version 330\n"
      "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
-@@ -1104,6 +1165,8 @@ static const char *TEX_FS =
+@@ -1104,6 +1187,8 @@ static const char *TEX_FS =
      "flat in int v_raw;       /* 1 = no color modulation */\n"
      "flat in ivec4 v_limits;  /* prim uv sampling bounds (inclusive, post-wrap) */\n"
      "flat in int v_semi;      /* GP0 command has semi-transparency enabled */\n"
@@ -1115,7 +1264,7 @@ index 2bb0e9f6..94535040 100644
      "uniform usampler2D u_vram;\n"
      "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
      "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
-@@ -1176,6 +1239,7 @@ static const char *TEX_FS =
+@@ -1176,6 +1261,7 @@ static const char *TEX_FS =
      "  }\n"
      "  if (u_semipass == 1 && stp == 1) discard;\n"
      "  if (u_semipass == 2 && stp == 0) discard;\n"
@@ -1123,7 +1272,7 @@ index 2bb0e9f6..94535040 100644
      "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
      "  float dst_factor = 0.0;\n"
      "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
-@@ -1350,9 +1414,71 @@ static void hr_end(void) {
+@@ -1350,9 +1436,96 @@ static void hr_end(void) {
          p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
      glDisable(GL_STENCIL_TEST);
      glDisable(GL_SCISSOR_TEST);
@@ -1177,6 +1326,31 @@ index 2bb0e9f6..94535040 100644
 +    glStencilMask(0x01);
 +    glDepthMask(GL_TRUE);
 +}
++/* Halton low-discrepancy sequence, centred on 0: the standard sub-pixel
++ * jitter pattern for temporal upscalers. */
++static float halton(uint32_t i, uint32_t base) {
++    float f = 1.0f, r = 0.0f;
++    while (i > 0) { f /= (float)base; r += f * (float)(i % base); i /= base; }
++    return r - 0.5f;
++}
++/* Remember which render (and its jitter / reset state) the current draw
++ * target buffer holds, keyed by the draw area's origin (= the display start
++ * when the game presents that buffer). */
++static void note_draw_buffer(void) {
++    if (!s_jitter_on) return;
++    extern int psx_mv_current_render_is_reset(void);
++    int slot = -1;
++    for (int i = 0; i < 4; i++)
++        if (s_ubuf[i].used && s_ubuf[i].x == s_area_x1 && s_ubuf[i].y == s_area_y1) { slot = i; break; }
++    if (slot < 0)
++        for (int i = 0; i < 4; i++) if (!s_ubuf[i].used) { slot = i; break; }
++    if (slot < 0) slot = (int)(s_render_id & 3u);
++    struct UpscaleBuf *b = &s_ubuf[slot];
++    b->used = 1; b->x = s_area_x1; b->y = s_area_y1;
++    b->render = s_render_id; b->jx = s_jit_x; b->jy = s_jit_y;
++    b->reset = psx_mv_current_render_is_reset();
++}
++
 +/* Reset scene depth (far) and motion (none) in the bound target, inside the
 + * current scissor — called wherever the game's own fills clear colour. */
 +static void scene_aux_clear(void) {
@@ -1196,7 +1370,7 @@ index 2bb0e9f6..94535040 100644
  }
  
  /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
-@@ -1468,7 +1594,7 @@ static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h
+@@ -1468,7 +1641,7 @@ static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h
      glDisable(GL_STENCIL_TEST);
      p_glBindVertexArray(0);
      p_glUseProgram(0);
@@ -1205,7 +1379,7 @@ index 2bb0e9f6..94535040 100644
  }
  
  static void rebuild_mask_stencils(void) {
-@@ -1507,7 +1633,7 @@ static void pack_flush(void) {
+@@ -1507,7 +1680,7 @@ static void pack_flush(void) {
      p_glBindVertexArray(0);
      p_glUseProgram(0);
      glDisable(GL_SCISSOR_TEST);
@@ -1214,7 +1388,7 @@ index 2bb0e9f6..94535040 100644
  }
  
  /* Make sure the raw mirror is current for a textured draw that samples the
-@@ -1552,7 +1678,7 @@ static void ensure_cpu(void) {
+@@ -1552,7 +1725,7 @@ static void ensure_cpu(void) {
      pack_flush();
      p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
      glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, s_vram);
@@ -1223,7 +1397,7 @@ index 2bb0e9f6..94535040 100644
      s_gpu_dirty = 0;
      coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
  }
-@@ -1738,6 +1864,8 @@ static int   s_tb_n = 0;                    /* verts queued */
+@@ -1738,6 +1911,8 @@ static int   s_tb_n = 0;                    /* verts queued */
  static int   s_tb_semi = -2;
  static int   s_tb_mask = 0, s_tb_filter = 0;
  static int   s_tb_twin[4] = {0, 0, 0, 0};
@@ -1232,7 +1406,7 @@ index 2bb0e9f6..94535040 100644
  static uint64_t s_batch_total = 0, s_batch_reason[7];
  
  void gl_renderer_batch_diag(uint64_t out[8]) {
-@@ -1802,6 +1930,10 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+@@ -1802,6 +1977,10 @@ static void tex_batch_draw_passes(int nverts, int semi) {
          p_glUniform1i(s_uSemipass, 2);
          glDrawArrays(GL_TRIANGLES, 0, nverts);
      }
@@ -1243,15 +1417,16 @@ index 2bb0e9f6..94535040 100644
  }
  
  /* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
-@@ -1856,6 +1988,7 @@ static void flush_tex_batch(void) {
+@@ -1856,6 +2035,8 @@ static void flush_tex_batch(void) {
      p_glBindVertexArray(s_tex_vao);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
      p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
 +    depth_write_begin(s_tb_z);
++    if (s_tb_z) note_draw_buffer();
  
      tex_batch_draw_passes(nverts, semi);
  
-@@ -1883,16 +2016,18 @@ static void flush_tex_batch(void) {
+@@ -1883,16 +2064,18 @@ static void flush_tex_batch(void) {
   * GP0(68h) 1x1 dots; each was two immediate gpu_triangle draws (BufferData +
   * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
  #define FLATBATCH_MAXV 8190                 /* multiple of 3 */
@@ -1272,7 +1447,7 @@ index 2bb0e9f6..94535040 100644
          if (x < flo) flo = x; if (x > fhi) fhi = x;
      }
      /* floor/ceil rather than a truncating cast — see mirror_batch_center_only. */
-@@ -1910,9 +2045,11 @@ static void flush_flat_batch(void) {
+@@ -1910,9 +2093,12 @@ static void flush_flat_batch(void) {
      p_glUseProgram(s_geo_prog);
      p_glBindVertexArray(s_geo_vao);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -1280,12 +1455,13 @@ index 2bb0e9f6..94535040 100644
 +    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * GEOV * sizeof(float)),
                     s_fb, PSXGL_STREAM_DRAW);
 +    depth_write_begin(s_fb_z);
++    if (s_fb_z) note_draw_buffer();
      glDrawArrays(GL_TRIANGLES, 0, nverts);
 +    if (s_mv_out && s_fb_mv && semi < 0) mv_pass(s_uGeoMv, nverts);
  
      if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
          !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts))) {
-@@ -1922,7 +2059,10 @@ static void flush_flat_batch(void) {
+@@ -1922,7 +2108,10 @@ static void flush_flat_batch(void) {
          gl_perf_mirror_begin();
          wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
          wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
@@ -1297,7 +1473,7 @@ index 2bb0e9f6..94535040 100644
          wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
          wide_target_end(s_geo_uXoff, s_geo_uXhalf);
          gl_perf_mirror_end();
-@@ -1943,15 +2083,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1943,15 +2132,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
      /* Lines stay immediate (rare); tris batch for MotK 0x68 starfields. */
      if (mode != GL_TRIANGLES || n < 3) {
          flush_flat_batch();
@@ -1323,7 +1499,7 @@ index 2bb0e9f6..94535040 100644
          }
          hr_begin(1);
          if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
-@@ -1960,7 +2103,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1960,7 +2152,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
          p_glUseProgram(s_geo_prog);
          p_glBindVertexArray(s_geo_vao);
          p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -1332,13 +1508,13 @@ index 2bb0e9f6..94535040 100644
                         verts, PSXGL_STREAM_DRAW);
          glDrawArrays(mode, 0, n);
          if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
-@@ -1979,22 +2122,30 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1979,22 +2171,30 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
          return;
      }
  
 -    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set))
 +    int has_z = s_depth_out && s_pz_valid;
-+    int has_mv = s_mv_out && s_pm_valid;
++    int has_mv = s_mv_out && (s_pm_valid || !s_pz_valid);   /* motion, or 2D -> zero */
 +    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set ||
 +                       s_fb_z != has_z || s_fb_mv != has_mv))
          flush_flat_batch();
@@ -1365,14 +1541,14 @@ index 2bb0e9f6..94535040 100644
          s_fb_n++;
      }
  }
-@@ -2092,8 +2243,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+@@ -2092,8 +2292,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
              s_batch_reason[reason]++;
              flush_tex_batch();
          }
 +        /* Depth-writing and depth-less prims cannot share a draw (depth writes
 +         * are per draw). Off, has_z is always 0 and this never splits. */
 +        int has_z = s_depth_out && s_pz_valid;
-+        int has_mv = s_mv_out && s_pm_valid;
++        int has_mv = s_mv_out && (s_pm_valid || !s_pz_valid);   /* motion, or 2D -> zero */
 +        if (s_tb_n > 0 && (has_z != s_tb_z || has_mv != s_tb_mv)) flush_tex_batch();
          if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
          if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
@@ -1381,7 +1557,7 @@ index 2bb0e9f6..94535040 100644
              s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
              s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
          }
-@@ -2110,6 +2268,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+@@ -2110,6 +2317,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
              vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
              vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
              vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
@@ -1391,7 +1567,7 @@ index 2bb0e9f6..94535040 100644
          }
          s_tb_n += 3;
          if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
-@@ -2128,9 +2289,10 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int
+@@ -2128,9 +2338,10 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int
      float b = (((c >> 10) & 0x1F) << 3) / 255.0f;
      float a = s_mask_set ? 1.0f : 0.0f;
      float fx0 = (float)wx, fy0 = (float)y, fx1 = (float)(wx + ww), fy1 = (float)(y + h);
@@ -1405,7 +1581,7 @@ index 2bb0e9f6..94535040 100644
      };
      /* Wide target: positions already wide-space so u_xoff = 0; full-width
       * scissor; u_xhalf = g_wide_w/2. */
-@@ -2225,6 +2387,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b)
+@@ -2225,6 +2436,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b)
      glClearStencil(0);
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1413,7 +1589,7 @@ index 2bb0e9f6..94535040 100644
      rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
  }
  
-@@ -2249,7 +2412,7 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
+@@ -2249,7 +2461,7 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
      if (h2)       fill_segment(x, 0, w1, h2, r, g, b);
      if (w2 && h2) fill_segment(0, 0, w2, h2, r, g, b);
      glDisable(GL_SCISSOR_TEST);
@@ -1422,7 +1598,7 @@ index 2bb0e9f6..94535040 100644
      if (!s_cpu_auth_dual)
          s_gpu_dirty = 1;
      coh_record(GL_COH_FILL, x, y, x + w - 1, y + h - 1);
-@@ -2280,8 +2443,8 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+@@ -2280,8 +2492,8 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
      p_glBlitFramebuffer(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
                          sx*S, sy*S, (sx+w)*S, (sy+h)*S,
                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -1433,7 +1609,7 @@ index 2bb0e9f6..94535040 100644
  
      hr_begin(0);   /* copies ignore the draw area */
      glScissor(dx*S, dy*S, w*S, h*S);
-@@ -2375,6 +2538,30 @@ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float
+@@ -2375,6 +2587,67 @@ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float
      s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
      sw_set_perspective_triangle(enabled, q0, q1, q2);
  }
@@ -1459,12 +1635,49 @@ index 2bb0e9f6..94535040 100644
 +/* Must be set before the renderer initialises (mods activate first); the
 + * motion attachments are only allocated when it is on. */
 +void gl_renderer_set_motion_output(int on) { s_mv_out = on ? 1 : 0; }
++
++/* A new render begins (display flip): bump the render id and, when an upscaler
++ * runs, move to the next jitter offset. Pending batches belong to the previous
++ * render, so they are drawn first with its jitter. */
++static void glb_begin_render(void) {
++    s_render_id++;
++    if (!s_jitter_on || !s_raster_ok) return;
++    flush_tex_batch();
++    flush_flat_batch();
++    const uint32_t phase = 1u + (s_render_id % 32u);          /* Halton(2,3), 32 phases */
++    s_jit_x = halton(phase, 2);
++    s_jit_y = halton(phase, 3);
++    const float jx = s_jit_x / (float)s_scale, jy = s_jit_y / (float)s_scale;   /* native px */
++    p_glUseProgram(s_geo_prog); p_glUniform2f(s_geo_uJitter, jx, jy);
++    p_glUseProgram(s_tex_prog); p_glUniform2f(s_tex_uJitter, jx, jy);
++    p_glUseProgram(0);
++}
++/* Enable per-render jitter (only while a temporal upscaler consumes it). */
++void gl_renderer_set_upscaler_jitter(int on) {
++    s_jitter_on = on ? 1 : 0;
++    if (!s_jitter_on && s_raster_ok) {
++        s_jit_x = s_jit_y = 0.f;
++        p_glUseProgram(s_geo_prog); p_glUniform2f(s_geo_uJitter, 0.f, 0.f);
++        p_glUseProgram(s_tex_prog); p_glUniform2f(s_tex_uJitter, 0.f, 0.f);
++        p_glUseProgram(0);
++    }
++}
++/* What the display buffer at (x, y) holds: its render id, jitter (render
++ * pixels) and whether that render is a history reset. 0 if unknown. */
++static int upscale_buffer_info(int x, int y, uint32_t *render, float *jx, float *jy, int *reset) {
++    for (int i = 0; i < 4; i++)
++        if (s_ubuf[i].used && s_ubuf[i].x == x && s_ubuf[i].y == y) {
++            *render = s_ubuf[i].render; *jx = s_ubuf[i].jx; *jy = s_ubuf[i].jy; *reset = s_ubuf[i].reset;
++            return 1;
++        }
++    return 0;
++}
 +int  gl_renderer_get_motion_output(void)   { return s_mv_out; }
 +int  gl_renderer_get_depth_output(void)   { return s_depth_out; }
  static void glb_set_draw_area(int x1,int y1,int x2,int y2) { flush_flat_batch(); flush_tex_batch(); s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
  static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
  static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_batch(); s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
-@@ -2385,7 +2572,7 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
+@@ -2385,7 +2658,7 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
   * SW @ 1× for authority, then GPU @ s_scale for present quality. */
  /* The sub-pixel / perspective override describes exactly one triangle; drop it
   * once that triangle has been submitted so a later prim can never inherit it. */
@@ -1473,7 +1686,7 @@ index 2bb0e9f6..94535040 100644
  
  static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
      if (s_cpu_auth_dual || !s_raster_ok)
-@@ -2538,6 +2725,7 @@ static void depth24_clear_skipped_fb(void) {
+@@ -2538,6 +2811,7 @@ static void depth24_clear_skipped_fb(void) {
      glClearStencil(0);
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1481,7 +1694,7 @@ index 2bb0e9f6..94535040 100644
      if (s_raw_fbo) {
          p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
          glViewport(0, 0, VRAM_W, VRAM_H);
-@@ -2545,7 +2733,7 @@ static void depth24_clear_skipped_fb(void) {
+@@ -2545,7 +2819,7 @@ static void depth24_clear_skipped_fb(void) {
          glClear(GL_COLOR_BUFFER_BIT);
      }
      glDisable(GL_SCISSOR_TEST);
@@ -1490,7 +1703,7 @@ index 2bb0e9f6..94535040 100644
      rect_add(&s_pack_dirty, x0, y0, x1, y1);
      present_dirty_rect(x0, y0, x1, y1, 1);
      rect_clear(&s_d24_skip_fb);
-@@ -2763,7 +2951,7 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
+@@ -2763,7 +3037,7 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
          p_glFramebufferRenderbuffer(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT,
                                      PSXGL_RENDERBUFFER, stencil_rb);
      GLenum st = p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER);
@@ -1499,7 +1712,7 @@ index 2bb0e9f6..94535040 100644
      if (st != PSXGL_FRAMEBUFFER_COMPLETE) {
          fprintf(stdout, "psxrecomp: GL FBO incomplete (0x%X)\n", st);
          return 0;
-@@ -2810,6 +2998,18 @@ static int init_gpu_raster(void) {
+@@ -2810,6 +3084,18 @@ static int init_gpu_raster(void) {
      p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
  
      if (!make_fbo(&s_hr_fbo, s_hr_tex, s_hr_rb)) return 0;
@@ -1518,16 +1731,18 @@ index 2bb0e9f6..94535040 100644
      if (!make_fbo(&s_raw_fbo, s_raw_tex, 0)) return 0;
      if (!make_fbo(&s_scratch_fbo, s_scratch_tex, 0)) return 0;
  
-@@ -2824,6 +3024,8 @@ static int init_gpu_raster(void) {
+@@ -2824,6 +3110,10 @@ static int init_gpu_raster(void) {
      s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
      s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
      s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
 +    s_uTexMv    = p_glGetUniformLocation(s_tex_prog, "u_mvpass");
 +    s_uGeoMv    = p_glGetUniformLocation(s_geo_prog, "u_mvpass");
++    s_tex_uJitter = p_glGetUniformLocation(s_tex_prog, "u_jitter");
++    s_geo_uJitter = p_glGetUniformLocation(s_geo_prog, "u_jitter");
      s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
      s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
      s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
-@@ -2877,10 +3079,14 @@ static int init_gpu_raster(void) {
+@@ -2877,10 +3167,14 @@ static int init_gpu_raster(void) {
      p_glBindVertexArray(s_geo_vao);
      p_glGenBuffers(1, &s_geo_vbo);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -1544,7 +1759,7 @@ index 2bb0e9f6..94535040 100644
  
      p_glGenVertexArrays(1, &s_tex_vao);
      p_glBindVertexArray(s_tex_vao);
-@@ -2898,6 +3104,8 @@ static int init_gpu_raster(void) {
+@@ -2898,6 +3192,8 @@ static int init_gpu_raster(void) {
          p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
          p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
          p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
@@ -1553,7 +1768,7 @@ index 2bb0e9f6..94535040 100644
      }
  
      p_glGenVertexArrays(1, &s_blit_vao);
-@@ -2919,7 +3127,8 @@ static int init_gpu_raster(void) {
+@@ -2919,7 +3215,8 @@ static int init_gpu_raster(void) {
      glClearStencil(0);
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1563,7 +1778,7 @@ index 2bb0e9f6..94535040 100644
      rect_clear(&s_pack_dirty);
      s_up_nrects = 0;
      up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
-@@ -2954,6 +3163,7 @@ int gl_renderer_init_context(SDL_Window *win) {
+@@ -2954,6 +3251,7 @@ int gl_renderer_init_context(SDL_Window *win) {
      s_present_h = 0;
      SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
      SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -1571,7 +1786,7 @@ index 2bb0e9f6..94535040 100644
      s_ctx = SDL_GL_CreateContext(win);
      if (!s_ctx) { fprintf(stdout, "psxrecomp: GL context creation failed (%s)\n", SDL_GetError()); return 0; }
      if (SDL_GL_MakeCurrent(win, s_ctx) != 0) { fprintf(stdout, "psxrecomp: MakeCurrent failed (%s)\n", SDL_GetError()); SDL_GL_DeleteContext(s_ctx); s_ctx=NULL; return 0; }
-@@ -2967,6 +3177,15 @@ int gl_renderer_init_context(SDL_Window *win) {
+@@ -2967,6 +3265,16 @@ int gl_renderer_init_context(SDL_Window *win) {
      glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
      const char *ver = (const char *)glGetString(GL_VERSION);
      fprintf(stdout, "psxrecomp: OpenGL context created (%s)\n", ver ? ver : "?");
@@ -1583,11 +1798,12 @@ index 2bb0e9f6..94535040 100644
 +            SDL_GL_SetSwapInterval(0);           /* GL no longer presents */
 +        }
 +        fprintf(stdout, "psxrecomp: presenter: %s\n", vkp_status());
++        if (s_dlss_want) fprintf(stdout, "psxrecomp: DLSS: %s\n", vkp_dlss_status());
 +    }
  
      /* All-or-nothing: any missing entry point / failed shader / bad FBO means
       * the whole GL renderer is unavailable and the runtime stays on the pure
-@@ -3035,6 +3254,7 @@ int gl_renderer_init_context(SDL_Window *win) {
+@@ -3035,6 +3343,7 @@ int gl_renderer_init_context(SDL_Window *win) {
   * exists. Adaptive falls back to vsync if unsupported. */
  void gl_renderer_set_swap_interval(int interval) {
      s_swap_interval = interval;
@@ -1595,13 +1811,33 @@ index 2bb0e9f6..94535040 100644
      if (s_ctx) {
          if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0) {
              SDL_GL_SetSwapInterval(1);
-@@ -3043,7 +3263,17 @@ void gl_renderer_set_swap_interval(int interval) {
+@@ -3043,7 +3352,37 @@ void gl_renderer_set_swap_interval(int interval) {
      }
  }
  
 +/* Present through Vulkan (vk_presenter.h) instead of GL. Set before the
 + * renderer initialises; falls back to GL if Vulkan can't start. */
 +void gl_renderer_set_vulkan_presenter(int on) { s_vkp_want = on ? 1 : 0; }
++void gl_renderer_set_dlss(int on) {
++    s_dlss_want = on ? 1 : 0;
++    vkp_set_dlss(s_dlss_want);
++}
++const char *gl_renderer_dlss_status(void) {
++    static char buf[640];
++    snprintf(buf, sizeof buf, "%s; jitter %s (sign %+d,%+d)", s_vkp_on ? vkp_dlss_status() : "off (no Vulkan presenter)",
++             s_jitter_on ? "on" : "off", s_dlss_jsign_x, s_dlss_jsign_y);
++    for (char *c = buf; *c; c++)                  /* JSON-safe for the debug server */
++        if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = '\'';
++    return buf;
++}
++/* Debug A/B: pause/resume DLSS after start (the presenter keeps Streamline). */
++void gl_renderer_dlss_runtime(int on) {
++    if (s_vkp_on) s_dlss_want = on ? 1 : 0;
++}
++void gl_renderer_dlss_jitter_sign(int sx, int sy) {
++    s_dlss_jsign_x = sx < 0 ? -1 : 1;
++    s_dlss_jsign_y = sy < 0 ? -1 : 1;
++}
 +const char *gl_renderer_presenter_status(void) { return s_vkp_on ? vkp_status() : "opengl"; }
 +
  void gl_renderer_shutdown(void) {
@@ -1613,7 +1849,7 @@ index 2bb0e9f6..94535040 100644
      if (s_ctx) {
          ensure_cpu();
          SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
-@@ -3269,7 +3499,7 @@ int gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out) {
+@@ -3269,7 +3608,7 @@ int gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out) {
      glPixelStorei(GL_PACK_ALIGNMENT, 2);
      glReadPixels(x, y, w, h, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, out);
      glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -1622,7 +1858,7 @@ index 2bb0e9f6..94535040 100644
      return 1;
  }
  
-@@ -3292,7 +3522,7 @@ int gl_renderer_vram_diff(uint32_t *count, int bbox[4],
+@@ -3292,7 +3631,7 @@ int gl_renderer_vram_diff(uint32_t *count, int bbox[4],
      coh_record(GL_COH_DIFF, 0, 0, VRAM_W - 1, VRAM_H - 1);
      p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
      glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, tmp);
@@ -1631,7 +1867,7 @@ index 2bb0e9f6..94535040 100644
      uint32_t n = 0;
      int x0 = VRAM_W, y0 = VRAM_H, x1 = -1, y1 = -1, ns = 0;
      for (int y = 0; y < VRAM_H; y++) {
-@@ -3357,6 +3587,7 @@ static void wide_free_all(void) {
+@@ -3357,6 +3696,7 @@ static void wide_free_all(void) {
          if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
          if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
          if (s_wide_rb[i])  { p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0; }
@@ -1639,7 +1875,7 @@ index 2bb0e9f6..94535040 100644
          s_wide_base[i] = -1;
      }
      g_wide_cur = 0;
-@@ -3387,12 +3618,20 @@ static GLuint wide_fbo_for(int base_x) {
+@@ -3387,12 +3727,20 @@ static GLuint wide_fbo_for(int base_x) {
              }
              /* Clear to black so unwritten margins are clean (not stale). */
              p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_wide_fbo[i]);
@@ -1662,7 +1898,7 @@ index 2bb0e9f6..94535040 100644
              s_wide_base[i] = base_x;
              return s_wide_fbo[i];
          }
-@@ -3454,8 +3693,9 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
+@@ -3454,8 +3802,9 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
      glClearStencil((color >> 15) & 1);   /* stencil mirrors bit15, like the color alpha */
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1673,7 +1909,7 @@ index 2bb0e9f6..94535040 100644
      gl_perf_mirror_end();
      s_cw_wide_ms += cw_ms() - t0;
  }
-@@ -3493,13 +3733,16 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
+@@ -3493,13 +3842,16 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
      if (sides & 1) {
          glScissor(0, y0, margin, y1 - y0);
          glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1691,7 +1927,7 @@ index 2bb0e9f6..94535040 100644
      gl_perf_mirror_end();
      s_cw_wide_ms += cw_ms() - t0;
  }
-@@ -3546,7 +3789,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
+@@ -3546,7 +3898,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
      p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
      glPixelStorei(GL_PACK_ALIGNMENT, 4);
      glReadPixels(0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
@@ -1700,7 +1936,7 @@ index 2bb0e9f6..94535040 100644
  
      /* Orientation: the wide FBO stores PS1 y inverted (geo shader maps vram_y=0
       * to NDC y=-1 = FBO BOTTOM), and glReadPixels reads bottom-up — the two
-@@ -3590,7 +3833,7 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
+@@ -3590,7 +3942,7 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
      p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
      glPixelStorei(GL_PACK_ALIGNMENT, 4);
      glReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
@@ -1709,7 +1945,7 @@ index 2bb0e9f6..94535040 100644
      /* Same orientation reasoning as glb_render_wide_display: glReadPixels row 0 =
       * PS1 top scanline, so copy straight (top-down). */
      int count = 0;
-@@ -3928,7 +4171,7 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
+@@ -3928,7 +4280,7 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
      glBindTexture(GL_TEXTURE_2D, s_interp_tex[dst]);
      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
                          x * s_scale, y * s_scale, pw, ph);
@@ -1718,7 +1954,7 @@ index 2bb0e9f6..94535040 100644
      if (s_interp_valid == 0) {
          s_interp_cur = dst;
          s_interp_valid = 1;
-@@ -3946,7 +4189,7 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
+@@ -3946,7 +4298,7 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
  
  static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
      int prev = s_interp_prev, curr = s_interp_cur;
@@ -1727,7 +1963,7 @@ index 2bb0e9f6..94535040 100644
      glViewport(lx, ly, lw, lh);
      p_glActiveTexture(PSXGL_TEXTURE0);
      glBindTexture(GL_TEXTURE_2D, s_interp_tex[prev]);
-@@ -4077,7 +4320,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+@@ -4077,7 +4429,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
      if (vx + dw > ww) dw = ww - vx;
      if (vy + dh > wh) dh = wh - vy;
      if (dw < 1 || dh < 1) return;
@@ -1736,7 +1972,7 @@ index 2bb0e9f6..94535040 100644
      glDisable(GL_SCISSOR_TEST);
      glDisable(GL_STENCIL_TEST);
      glDisable(GL_DEPTH_TEST);
-@@ -4105,6 +4348,11 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+@@ -4105,6 +4457,11 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
  }
  
  /* Composite host toast + volume bar into the default framebuffer, then swap. */
@@ -1748,7 +1984,7 @@ index 2bb0e9f6..94535040 100644
  static void gl_swap_with_osd(void) {
      if (s_present_prog && s_ctx) {
          int ww = 0, wh = 0;
-@@ -4151,15 +4399,35 @@ static void gl_swap_with_osd(void) {
+@@ -4151,15 +4508,35 @@ static void gl_swap_with_osd(void) {
          extern void present_shot_done(int ok);
          char shot_path[512];
          if (present_shot_take(shot_path, (int)sizeof(shot_path))) {
@@ -1785,7 +2021,7 @@ index 2bb0e9f6..94535040 100644
                      for (int y = 0; y < wh; y++)
                          memcpy(flip + (size_t)y * ww * 3,
                                 rows + (size_t)(wh - 1 - y) * ww * 3,
-@@ -4174,9 +4442,20 @@ static void gl_swap_with_osd(void) {
+@@ -4174,9 +4551,20 @@ static void gl_swap_with_osd(void) {
                  free(flip);
                  free(rows);
              }
@@ -1806,7 +2042,7 @@ index 2bb0e9f6..94535040 100644
      SDL_GL_SwapWindow(s_win);
  }
  
-@@ -4184,7 +4463,7 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+@@ -4184,7 +4572,7 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
                                  int x, int y, int w, int h, int linear,
                                  int lx, int ly, int lw, int lh, int v_flip) {
      float u0, v0, u1, v1;
@@ -1815,7 +2051,7 @@ index 2bb0e9f6..94535040 100644
      /* Optional solid-background extension for native 4:3 UI inside a wide
       * window. Only side panels within the configured aspect are colored. */
      uint16_t background;
-@@ -4240,6 +4519,87 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+@@ -4240,6 +4628,140 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
      p_glUseProgram(0);
  }
  
@@ -1852,6 +2088,59 @@ index 2bb0e9f6..94535040 100644
 +    p_glBindVertexArray(0);
 +    p_glUseProgram(0);
 +    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++}
++
++/* DLSS (Vulkan presenter + Streamline): copy the displayed region's colour,
++ * depth and motion into the presenter's DLSS inputs and let it put the DLSS
++ * image into the letterbox rectangle, over the GL quad already drawn there
++ * (which stays as the fallback if DLSS can't run). key_x/key_y identify the
++ * displayed buffer for its jitter/reset record. Jitter runs only while DLSS is
++ * actually in use for the current sizes. */
++static void dlss_composite(GLuint src_fbo, int key_x, int key_y, int x, int y, int w, int h,
++                           int lx, int ly, int lw, int lh) {
++    if (!s_vkp_on) return;
++    if (!s_dlss_want) {                           /* switched off at runtime */
++        if (s_jitter_on) gl_renderer_set_upscaler_jitter(0);
++        return;
++    }
++    const int S = s_scale, iw = w * S, ih = h * S;
++    const int mode = (s_depth_out && s_mv_out) ? vkp_dlss_configure(iw, ih, lw, lh) : 0;
++    if ((mode != 0) != (s_jitter_on != 0)) gl_renderer_set_upscaler_jitter(mode != 0);
++    if (!mode) return;
++    const GLuint dst = vkp_dlss_input_fbo();
++    if (!dst) return;
++    uint32_t rid = 0; float jx = 0.f, jy = 0.f; int reset = 0;
++    if (!upscale_buffer_info(key_x, key_y, &rid, &jx, &jy, &reset)) reset = 1;
++    /* Both are top-down (VRAM row 0 = screen top), so a straight copy. */
++    GLenum buf = PSXGL_COLOR_ATTACHMENT0;
++    glDisable(GL_SCISSOR_TEST);
++    glDepthMask(GL_TRUE);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src_fbo);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, dst);
++    glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
++    p_glDrawBuffers(1, &buf);
++    p_glBlitFramebuffer(x * S, y * S, (x + w) * S, (y + h) * S, 0, 0, iw, ih,
++                        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
++    buf = PSXGL_COLOR_ATTACHMENT1;
++    glReadBuffer(PSXGL_COLOR_ATTACHMENT1);
++    p_glDrawBuffers(1, &buf);
++    p_glBlitFramebuffer(x * S, y * S, (x + w) * S, (y + h) * S, 0, 0, iw, ih,
++                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
++    glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
++    VkpDlssFrame f;
++    memset(&f, 0, sizeof f);
++    f.render_id = rid;
++    f.jitter_x = jx * (float)s_dlss_jsign_x;
++    f.jitter_y = jy * (float)s_dlss_jsign_y;
++    /* Motion is current - previous in native pixels; DLSS wants previous -
++     * current, normalised to the input size. */
++    f.mvec_scale_x = -(float)S / (float)iw;
++    f.mvec_scale_y = -(float)S / (float)ih;
++    f.reset = reset;
++    f.lx = lx; f.ly = ly; f.lw = lw; f.lh = lh;
++    vkp_dlss_run(&f);
 +}
 +
 +/* Motion capture for the accuracy check (debug server "mv_capture"). Reads
@@ -1903,7 +2192,7 @@ index 2bb0e9f6..94535040 100644
  /* Bezel art: a still image behind the frame, filling whatever the letterbox or
   * pillarbox leaves over. It never samples the frame, so unlike an edge-stretch
   * backdrop it is independent of what the game is currently drawing. */
-@@ -4270,7 +4630,7 @@ int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
+@@ -4270,7 +4792,7 @@ int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
  static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
      if (!s_bezel_tex || ww <= 0 || wh <= 0) return;
      if (lx <= 0 && ly <= 0 && lw >= ww && lh >= wh) return;
@@ -1912,7 +2201,7 @@ index 2bb0e9f6..94535040 100644
      glDisable(GL_SCISSOR_TEST);
      glDisable(GL_BLEND);
      glViewport(0, 0, ww, wh);
-@@ -4374,7 +4734,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+@@ -4374,7 +4896,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
       * display mode (e.g. 216/224-line menus) must fill the rect as before.
       * The FMV band fix lives in the depth24/CPU present paths only. */
  
@@ -1921,16 +2210,17 @@ index 2bb0e9f6..94535040 100644
      glDisable(GL_SCISSOR_TEST);
      glViewport(0, 0, ww, wh);
      if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
-@@ -4397,6 +4757,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+@@ -4397,6 +4919,9 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
      present_bezel(ww, wh, lx, ly, lw, lh);
      present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                          disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
 +    present_scene_depth(s_hr_fbo, disp_x, disp_y, w, h, lx, ly, lw, lh);
++    dlss_composite(s_hr_fbo, disp_x, disp_y, disp_x, disp_y, w, h, lx, ly, lw, lh);
 +    mv_capture_frame(s_hr_fbo, disp_x, disp_y, w, h);
      pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4439,9 +4801,24 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
+@@ -4439,9 +4964,24 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
                          (base_x + native_w) * S, VRAM_H * S,
                          g_wide_off * S, 0,
                          (g_wide_off + native_w) * S, VRAM_H * S,
@@ -1958,7 +2248,7 @@ index 2bb0e9f6..94535040 100644
  }
  
  /* GPU-direct native-wide present: blit the displayed buffer's wide FBO straight
-@@ -4480,7 +4857,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+@@ -4480,7 +5020,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
      letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
      wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
  
@@ -1967,35 +2257,41 @@ index 2bb0e9f6..94535040 100644
      glDisable(GL_SCISSOR_TEST);
      glViewport(0, 0, ww, wh);
      if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
-@@ -4501,6 +4878,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+@@ -4501,6 +5041,9 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
      }
      present_target_quad(tex, g_wide_w, VRAM_H,
                          0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1);
 +    present_scene_depth(fbo, 0, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
++    dlss_composite(fbo, disp_x, disp_y, 0, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
 +    mv_capture_frame(fbo, 0, disp_y, g_wide_w, disp_h);
      pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4524,6 +4903,8 @@ static const GpuRenderBackend GL_BACKEND = {
+@@ -4524,6 +5067,9 @@ static const GpuRenderBackend GL_BACKEND = {
      .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
      .set_precise_triangle = glb_set_precise_triangle,
      .set_perspective_triangle = glb_set_perspective_triangle,
 +    .set_triangle_depth = glb_set_triangle_depth,
 +    .set_triangle_motion = glb_set_triangle_motion,
++    .begin_render = glb_begin_render,
      .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
      .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
      .draw_textured_triangle = glb_draw_textured_triangle,
 diff --git a/runtime/src/gpu_render.c b/runtime/src/gpu_render.c
-index c833f491..572b73cd 100644
+index c833f491..a80c259e 100644
 --- a/runtime/src/gpu_render.c
 +++ b/runtime/src/gpu_render.c
-@@ -112,6 +112,14 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+@@ -112,6 +112,18 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
      if (g_b->set_perspective_triangle)
          g_b->set_perspective_triangle(enabled, q0, q1, q2);
  }
 +void gr_set_triangle_depth(int valid, uint16_t z0, uint16_t z1, uint16_t z2) {
 +    if (g_b->set_triangle_depth)
 +        g_b->set_triangle_depth(valid, z0, z1, z2);
++}
++void gr_begin_render(void) {
++    if (g_b->begin_render)
++        g_b->begin_render();
 +}
 +void gr_set_triangle_motion(int valid, const int32_t dx16[3], const int32_t dy16[3]) {
 +    if (g_b->set_triangle_motion)
@@ -2005,7 +2301,7 @@ index c833f491..572b73cd 100644
  void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
  void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
 diff --git a/runtime/src/gte.cpp b/runtime/src/gte.cpp
-index 211007b9..62e46102 100644
+index 211007b9..50b98103 100644
 --- a/runtime/src/gte.cpp
 +++ b/runtime/src/gte.cpp
 @@ -2,10 +2,13 @@
@@ -2040,7 +2336,7 @@ index 211007b9..62e46102 100644
          auto sxx = [](int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x10000:v; };
          auto syy = [](int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; };
          if (pos > outsz - 700) break;
-@@ -791,6 +796,253 @@ extern "C" void gte_set_display_aspect(int num, int den) {
+@@ -791,6 +796,256 @@ extern "C" void gte_set_display_aspect(int num, int den) {
      s_ws_xden = d / a;
  }
  
@@ -2157,6 +2453,9 @@ index 211007b9..62e46102 100644
 +    s_mv_stats.frames++;
 +}
 +extern "C" int psx_mv_last_render_was_reset(void) { return s_mv_last_reset; }
++/* The render being drawn right now has no motion history (cut, first 3D after
++ * menus/FMV, or motion just enabled). Settles at its first static projection. */
++extern "C" int psx_mv_current_render_is_reset(void) { return s_mv_cut || !s_mv_have_prev; }
 +extern "C" unsigned long long psx_mv_frame_count(void) { return s_mv_stats.frames; }
 +extern "C" int psx_mv_stats_json(char* out, int n) {
 +    int k = 0;
@@ -2294,7 +2593,7 @@ index 211007b9..62e46102 100644
  // ---------------------------------------------------------------------------
  // RTPS — Perspective Transformation (internal, operates on given vertex V)
  //
-@@ -869,8 +1121,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+@@ -869,8 +1124,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
              if (!s_gte_replay_sandbox) s_ws_sz_far++;
          }
      }
@@ -2307,7 +2606,7 @@ index 211007b9..62e46102 100644
      // Native-wide dome expansion remains a diagnostic-only depth probe.
      else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
               !gpu_ws_present_native_43()) {
-@@ -882,6 +1137,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+@@ -882,6 +1140,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
          }
          if (sz >= s_ws_far_threshold) {
              xterm = xterm * s_ws_dome_num / s_ws_dome_den;
@@ -2315,7 +2614,7 @@ index 211007b9..62e46102 100644
              if (!s_gte_replay_sandbox) s_ws_sz_far++;
          }
      }
-@@ -899,6 +1155,8 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+@@ -899,6 +1158,8 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
          int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
          pgxp_gte_push_sxy((int32_t)cx16, (int32_t)cy16, gte->SZ[3],
                            (uint32_t)gte->SXY[2]);
@@ -2394,12 +2693,283 @@ index 52c57bca..134c5d8a 100644
  extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
                                         int32_t int_x, int32_t int_y,
                                         int32_t *x16, int32_t *y16,
+diff --git a/runtime/src/sl_bridge.cpp b/runtime/src/sl_bridge.cpp
+new file mode 100644
+index 00000000..c5f3848b
+--- /dev/null
++++ b/runtime/src/sl_bridge.cpp
+@@ -0,0 +1,265 @@
++/* sl_bridge.cpp — NVIDIA Streamline (DLSS Super Resolution) for the Vulkan
++ * presenter. See sl_bridge.h.
++ *
++ * Integration shape (Streamline 2.14, Vulkan):
++ *   slInit (renderAPI Vulkan, DLSS, frame-based tagging)
++ *   -> instance + device created through sl.interposer's vkGetInstanceProcAddr,
++ *      so Streamline adds its extensions/queues and sees every present
++ *   -> slIsFeatureSupported, slGetFeatureFunction(slDLSS*)
++ *   per new frame: slGetNewFrameToken, slSetConstants, slDLSSSetOptions,
++ *   slEvaluateFeature with the four tagged images, on the presenter's command
++ *   buffer. Streamline manages image states; the caller passes their layouts.
++ *
++ * Conventions not spelled out in the Streamline headers:
++ *   motion vectors: DLSS wants previous - current; the caller's mvec scale
++ *   carries the sign. Jitter: render pixels, as applied to the geometry. */
++#include "sl_bridge.h"
++
++#if defined(PSX_STREAMLINE) && defined(_WIN32)
++
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <cfloat>
++#include <cstdarg>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include "sl.h"
++#include "sl_dlss.h"
++
++namespace {
++
++HMODULE g_lib = nullptr;
++PFun_slInit *p_slInit = nullptr;
++PFun_slShutdown *p_slShutdown = nullptr;
++PFun_slIsFeatureSupported *p_slIsFeatureSupported = nullptr;
++PFun_slGetFeatureFunction *p_slGetFeatureFunction = nullptr;
++PFun_slGetNewFrameToken *p_slGetNewFrameToken = nullptr;
++PFun_slSetConstants *p_slSetConstants = nullptr;
++PFun_slEvaluateFeature *p_slEvaluateFeature = nullptr;
++PFun_slDLSSGetOptimalSettings *p_slDLSSGetOptimalSettings = nullptr;
++PFun_slDLSSSetOptions *p_slDLSSSetOptions = nullptr;
++void *g_gipa = nullptr;
++int g_initialised = 0, g_dlss_ok = 0;
++char g_status[256] = "not loaded";
++
++sl::ViewportHandle g_viewport{0};
++sl::DLSSOptions g_opts{};
++uint32_t g_cfg_in_w = 0, g_cfg_in_h = 0, g_cfg_out_w = 0, g_cfg_out_h = 0;
++int g_cfg_mode = 0;
++
++void status(const char *fmt, ...) {
++    va_list ap; va_start(ap, fmt);
++    vsnprintf(g_status, sizeof g_status, fmt, ap);
++    va_end(ap);
++}
++
++void on_sl_log(sl::LogType type, const char *msg) {
++    if (type == sl::LogType::eError && msg)
++        snprintf(g_status, sizeof g_status, "streamline: %s", msg);
++}
++
++template <typename T> T *load(const char *name) {
++    return reinterpret_cast<T *>(reinterpret_cast<void *>(GetProcAddress(g_lib, name)));
++}
++
++/* Row-major 4x4 helpers for the constants Streamline wants filled. */
++void identity(sl::float4x4 &m) {
++    m.setRow(0, sl::float4(1, 0, 0, 0));
++    m.setRow(1, sl::float4(0, 1, 0, 0));
++    m.setRow(2, sl::float4(0, 0, 1, 0));
++    m.setRow(3, sl::float4(0, 0, 0, 1));
++}
++
++}  // namespace
++
++extern "C" int slb_load(void) {
++    if (g_initialised) return 1;
++    wchar_t dir[MAX_PATH];
++    DWORD n = GetModuleFileNameW(nullptr, dir, MAX_PATH);
++    while (n > 0 && dir[n - 1] != L'\\' && dir[n - 1] != L'/') n--;
++    dir[n] = 0;
++    wchar_t path[MAX_PATH];
++    swprintf(path, MAX_PATH, L"%lssl.interposer.dll", dir);
++    g_lib = LoadLibraryW(path);                     /* full path, never the search order */
++    if (!g_lib) { status("off (sl.interposer.dll not next to the exe; run tools/soup/fetch_streamline.py)"); return 0; }
++    p_slInit = load<PFun_slInit>("slInit");
++    p_slShutdown = load<PFun_slShutdown>("slShutdown");
++    p_slIsFeatureSupported = load<PFun_slIsFeatureSupported>("slIsFeatureSupported");
++    p_slGetFeatureFunction = load<PFun_slGetFeatureFunction>("slGetFeatureFunction");
++    p_slGetNewFrameToken = load<PFun_slGetNewFrameToken>("slGetNewFrameToken");
++    p_slSetConstants = load<PFun_slSetConstants>("slSetConstants");
++    p_slEvaluateFeature = load<PFun_slEvaluateFeature>("slEvaluateFeature");
++    g_gipa = reinterpret_cast<void *>(GetProcAddress(g_lib, "vkGetInstanceProcAddr"));
++    if (!p_slInit || !p_slShutdown || !p_slIsFeatureSupported || !p_slGetFeatureFunction ||
++        !p_slGetNewFrameToken || !p_slSetConstants || !p_slEvaluateFeature || !g_gipa) {
++        status("off (sl.interposer.dll is missing exports)");
++        FreeLibrary(g_lib); g_lib = nullptr;
++        return 0;
++    }
++    static const sl::Feature features[] = { sl::kFeatureDLSS };
++    static const wchar_t *plugin_paths[1];
++    plugin_paths[0] = dir;
++    sl::Preferences pref{};
++    pref.showConsole = false;
++    pref.logLevel = sl::LogLevel::eDefault;
++    pref.logMessageCallback = on_sl_log;
++    pref.pathToLogsAndData = nullptr;                /* no log files */
++    pref.pathsToPlugins = plugin_paths;
++    pref.numPathsToPlugins = 1;
++    pref.featuresToLoad = features;
++    pref.numFeaturesToLoad = 1;
++    pref.renderAPI = sl::RenderAPI::eVulkan;
++    pref.engine = sl::EngineType::eCustom;
++    pref.engineVersion = "psxrecomp";
++    pref.projectId = "5b8f2f5e-1d3c-4a8e-9a4b-7c0e5f1d2a6b";   /* Wipeout Soup (arbitrary, stable) */
++    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
++    sl::Result r = p_slInit(pref, sl::kSDKVersion);
++    if (r != sl::Result::eOk) {
++        if (strncmp(g_status, "streamline:", 11) != 0) status("off (slInit failed: %d)", (int)r);
++        FreeLibrary(g_lib); g_lib = nullptr;
++        return 0;
++    }
++    g_initialised = 1;
++    status("loaded (no device yet)");
++    return 1;
++}
++
++extern "C" void *slb_vk_get_instance_proc_addr(void) { return g_initialised ? g_gipa : nullptr; }
++
++extern "C" int slb_device_ready(void *vk_instance, void *vk_physical_device, void *vk_device) {
++    (void)vk_instance; (void)vk_device;
++    if (!g_initialised) return 0;
++    sl::AdapterInfo ai{};
++    ai.vkPhysicalDevice = vk_physical_device;
++    sl::Result r = p_slIsFeatureSupported(sl::kFeatureDLSS, ai);
++    if (r != sl::Result::eOk) { status("off (DLSS not supported here: result %d)", (int)r); return 0; }
++    void *f = nullptr;
++    if (p_slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", f) != sl::Result::eOk || !f) {
++        status("off (slDLSSGetOptimalSettings unavailable)"); return 0;
++    }
++    p_slDLSSGetOptimalSettings = reinterpret_cast<PFun_slDLSSGetOptimalSettings *>(f);
++    f = nullptr;
++    if (p_slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", f) != sl::Result::eOk || !f) {
++        status("off (slDLSSSetOptions unavailable)"); return 0;
++    }
++    p_slDLSSSetOptions = reinterpret_cast<PFun_slDLSSSetOptions *>(f);
++    g_dlss_ok = 1;
++    status("ready (DLSS supported)");
++    return 1;
++}
++
++/* Mode from the output/input ratio, then checked against DLSS's allowed
++ * render range for that mode (dynamic resolution). */
++extern "C" int slb_dlss_configure(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h) {
++    if (!g_dlss_ok || !in_w || !in_h || !out_w || !out_h) return 0;
++    if (in_w == g_cfg_in_w && in_h == g_cfg_in_h && out_w == g_cfg_out_w && out_h == g_cfg_out_h)
++        return g_cfg_mode;
++    g_cfg_in_w = in_w; g_cfg_in_h = in_h; g_cfg_out_w = out_w; g_cfg_out_h = out_h; g_cfg_mode = 0;
++    const double ratio = std::fmin((double)out_w / in_w, (double)out_h / in_h);
++    if (ratio < 0.999) { status("idle (output %ux%u smaller than input %ux%u)", out_w, out_h, in_w, in_h); return 0; }
++    static const sl::DLSSMode order[] = { sl::DLSSMode::eDLAA, sl::DLSSMode::eUltraQuality, sl::DLSSMode::eMaxQuality,
++                                          sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
++                                          sl::DLSSMode::eUltraPerformance };
++    for (sl::DLSSMode m : order) {
++        sl::DLSSOptions o{};
++        o.mode = m;
++        o.outputWidth = out_w;
++        o.outputHeight = out_h;
++        o.colorBuffersHDR = sl::Boolean::eFalse;      /* LDR (RGBA8) input */
++        o.useAutoExposure = sl::Boolean::eTrue;
++        sl::DLSSOptimalSettings s{};
++        if (p_slDLSSGetOptimalSettings(o, s) != sl::Result::eOk) continue;
++        if (in_w < s.renderWidthMin || in_h < s.renderHeightMin ||
++            in_w > s.renderWidthMax || in_h > s.renderHeightMax) continue;
++        if (p_slDLSSSetOptions(g_viewport, o) != sl::Result::eOk) continue;
++        g_opts = o;
++        g_cfg_mode = (int)m;
++        static const char *names[] = { "off", "performance", "balanced", "quality", "ultra performance", "ultra quality", "DLAA" };
++        status("DLSS %s, %ux%u -> %ux%u", names[(int)m], in_w, in_h, out_w, out_h);
++        return g_cfg_mode;
++    }
++    status("idle (no DLSS mode accepts %ux%u -> %ux%u)", in_w, in_h, out_w, out_h);
++    return 0;
++}
++
++static sl::Resource resource(const SlbImage &im) {
++    sl::Resource r{};
++    r.type = sl::ResourceType::eTex2d;
++    r.native = im.image;
++    r.memory = nullptr;
++    r.view = im.view;
++    r.state = im.layout;
++    r.width = im.width;
++    r.height = im.height;
++    r.nativeFormat = im.format;
++    r.mipLevels = 1;
++    r.arrayLayers = 1;
++    r.flags = 0;
++    r.usage = im.usage;
++    return r;
++}
++
++extern "C" int slb_dlss_evaluate(void *cmd, const SlbFrame *f) {
++    if (!g_dlss_ok || !g_cfg_mode || !cmd || !f) return 0;
++    uint32_t index = f->frame_index;
++    sl::FrameToken *token = nullptr;
++    if (p_slGetNewFrameToken(token, &index) != sl::Result::eOk || !token) { status("evaluate: no frame token"); return 0; }
++
++    sl::Constants c{};
++    identity(c.cameraViewToClip); identity(c.clipToCameraView); identity(c.clipToLensClip);
++    identity(c.clipToPrevClip); identity(c.prevClipToClip);
++    c.jitterOffset = sl::float2(f->jitter_x, f->jitter_y);
++    c.mvecScale = sl::float2(f->mvec_scale_x, f->mvec_scale_y);
++    c.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
++    c.cameraPos = sl::float3(0.0f, 0.0f, 0.0f);
++    c.cameraUp = sl::float3(0.0f, 1.0f, 0.0f);
++    c.cameraRight = sl::float3(1.0f, 0.0f, 0.0f);
++    c.cameraFwd = sl::float3(0.0f, 0.0f, 1.0f);
++    c.cameraNear = 1.0f;
++    c.cameraFar = 65536.0f;
++    c.cameraFOV = 1.0f;
++    c.cameraAspectRatio = (float)f->in_w / (float)f->in_h;
++    c.motionVectorsInvalidValue = FLT_MAX;
++    c.depthInverted = sl::Boolean::eFalse;
++    c.cameraMotionIncluded = sl::Boolean::eTrue;
++    c.motionVectors3D = sl::Boolean::eFalse;
++    c.reset = f->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
++    if (p_slSetConstants(c, *token, g_viewport) != sl::Result::eOk) { status("evaluate: constants rejected"); return 0; }
++
++    sl::Resource rc = resource(f->color), rd = resource(f->depth), rm = resource(f->mvec), ro = resource(f->output);
++    const sl::Extent in_ext{ f->in_y, f->in_x, f->in_w, f->in_h };   /* top, left, width, height */
++    const sl::Extent out_ext{ 0, 0, f->out_w, f->out_h };
++    sl::ResourceTag tags[4] = {
++        sl::ResourceTag{ &rc, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &in_ext },
++        sl::ResourceTag{ &rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &in_ext },
++        sl::ResourceTag{ &rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &in_ext },
++        sl::ResourceTag{ &ro, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &out_ext },
++    };
++    const sl::BaseStructure *inputs[] = { &g_viewport, &tags[0], &tags[1], &tags[2], &tags[3] };
++    sl::Result r = p_slEvaluateFeature(sl::kFeatureDLSS, *token, inputs, 5, cmd);
++    if (r != sl::Result::eOk) { status("evaluate failed: result %d", (int)r); return 0; }
++    return 1;
++}
++
++extern "C" void slb_shutdown(void) {
++    if (g_initialised && p_slShutdown) p_slShutdown();
++    if (g_lib) FreeLibrary(g_lib);
++    g_lib = nullptr; g_gipa = nullptr; g_initialised = 0; g_dlss_ok = 0;
++    g_cfg_in_w = g_cfg_in_h = g_cfg_out_w = g_cfg_out_h = 0; g_cfg_mode = 0;
++    status("not loaded");
++}
++
++extern "C" const char *slb_status(void) { return g_status; }
++
++#else  /* !PSX_STREAMLINE */
++
++extern "C" int slb_load(void) { return 0; }
++extern "C" void *slb_vk_get_instance_proc_addr(void) { return 0; }
++extern "C" int slb_device_ready(void *a, void *b, void *c) { (void)a; (void)b; (void)c; return 0; }
++extern "C" int slb_dlss_configure(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { (void)a; (void)b; (void)c; (void)d; return 0; }
++extern "C" int slb_dlss_evaluate(void *cmd, const SlbFrame *f) { (void)cmd; (void)f; return 0; }
++extern "C" void slb_shutdown(void) {}
++extern "C" const char *slb_status(void) { return "off (not built: PSX_STREAMLINE)"; }
++
++#endif
 diff --git a/runtime/src/vk_presenter.c b/runtime/src/vk_presenter.c
 new file mode 100644
-index 00000000..e5a5f00a
+index 00000000..2b21f774
 --- /dev/null
 +++ b/runtime/src/vk_presenter.c
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,1014 @@
 +/* vk_presenter.c — Vulkan presenter for the OpenGL renderer. See vk_presenter.h.
 + *
 + * Frame protocol (binary semaphores, both exported to GL):
@@ -2420,7 +2990,17 @@ index 00000000..e5a5f00a
 + * client area on every present.
 + *
 + * Vulkan is loaded at runtime from vulkan-1.dll (no link dependency). The
-+ * headers come from the game project (PSX_VK_PRESENTER builds only). */
++ * headers come from the game project (PSX_VK_PRESENTER builds only).
++ *
++ * DLSS (vkp_dlss_*, Streamline via sl_bridge): when wanted, the instance and
++ * device are created through sl.interposer's vkGetInstanceProcAddr. Per
++ * presented frame, before the OSD, GL copies the displayed region's colour,
++ * depth and motion into three more shared images and hands them over with the
++ * same semaphore pair; Vulkan runs DLSS into a Vulkan-only output image and
++ * blits it into the letterbox rectangle of the shared window image, then gives
++ * everything back to GL, which draws the OSD on top and presents as usual.
++ * DLSS only runs once per game render; a repeated present re-blits the last
++ * output. */
 +#include "vk_presenter.h"
 +
 +#if defined(PSX_VK_PRESENTER) && defined(_WIN32)
@@ -2433,6 +3013,7 @@ index 00000000..e5a5f00a
 +#include <SDL3/SDL.h>
 +#include <stdio.h>
 +#include <string.h>
++#include "sl_bridge.h"
 +
 +/* ---- GL entry points this file needs (loaded through SDL) ---------------- */
 +typedef unsigned int GLenum_, GLuint_; typedef int GLint_, GLsizei_; typedef unsigned long long GLuint64_;
@@ -2450,6 +3031,11 @@ index 00000000..e5a5f00a
 +#define VKP_GL_LAYOUT_TRANSFER_SRC 0x9592
 +#define VKP_GL_NUM_EXTENSIONS 0x821D
 +#define VKP_GL_EXTENSIONS 0x1F03
++#define VKP_GL_RGBA16F 0x881A
++#define VKP_GL_COLOR_ATTACHMENT1 0x8CE1
++#define VKP_GL_LAYOUT_DEPTH_STENCIL_READ_ONLY 0x9590
++#define VKP_GL_LAYOUT_SHADER_READ_ONLY 0x9591
++#define VKP_GL_LAYOUT_TRANSFER_DST 0x9593
 +static struct {
 +    void (APIENTRY *CreateMemoryObjectsEXT)(GLsizei_, GLuint_ *);
 +    void (APIENTRY *DeleteMemoryObjectsEXT)(GLsizei_, const GLuint_ *);
@@ -2534,6 +3120,31 @@ index 00000000..e5a5f00a
 +VKF(vkBeginCommandBuffer); VKF(vkEndCommandBuffer); VKF(vkResetCommandBuffer); VKF(vkCmdPipelineBarrier);
 +VKF(vkCmdBlitImage); VKF(vkQueueSubmit); VKF(vkQueuePresentKHR); VKF(vkAcquireNextImageKHR); VKF(vkCreateFence);
 +VKF(vkDestroyFence); VKF(vkWaitForFences); VKF(vkResetFences); VKF(vkDeviceWaitIdle);
++VKF(vkCreateImageView); VKF(vkDestroyImageView);
++
++/* ---- DLSS state ------------------------------------------------------------ */
++/* A Vulkan image in exportable memory, imported into GL as a texture. */
++typedef struct ShImg {
++    VkImage img; VkDeviceMemory mem; VkImageView view;
++    GLuint_ gl_mem, gl_tex;
++    VkFormat fmt; VkImageUsageFlags usage; VkImageAspectFlags aspect;
++} ShImg;
++static int s_dlss_want = 0;      /* set before vkp_prepare */
++static struct {
++    int ready;                   /* Streamline loaded and DLSS supported on V.pd */
++    ShImg in_color, in_depth, in_mvec;
++    GLuint_ in_fbo;
++    int in_w, in_h;
++    VkImage out_img; VkDeviceMemory out_mem; VkImageView out_view;
++    int out_w, out_h, out_valid;
++    int mode;
++    uint32_t last_render; int have_last, force_reset;
++    uint32_t frame_index;
++    VkCommandBuffer cb; VkFence fence; int fence_pending;
++    unsigned long long evals, reuses, fails;
++    int create_fails;            /* image setup failures; DLSS gives up after a few */
++    char status[256];
++} D;
 +
 +/* ---- child window that Vulkan presents to -------------------------------- */
 +static HWND s_parent, s_child;
@@ -2617,7 +3228,7 @@ index 00000000..e5a5f00a
 +    D(vkDestroyCommandPool); D(vkAllocateCommandBuffers); D(vkBeginCommandBuffer); D(vkEndCommandBuffer);
 +    D(vkResetCommandBuffer); D(vkCmdPipelineBarrier); D(vkCmdBlitImage); D(vkQueueSubmit); D(vkQueuePresentKHR);
 +    D(vkAcquireNextImageKHR); D(vkCreateFence); D(vkDestroyFence); D(vkWaitForFences); D(vkResetFences);
-+    D(vkDeviceWaitIdle);
++    D(vkDeviceWaitIdle); D(vkCreateImageView); D(vkDestroyImageView);
 +#undef D
 +    return 1;
 +}
@@ -2806,6 +3417,7 @@ index 00000000..e5a5f00a
 +}
 +
 +static int s_prepared = 0;   /* Vulkan half done (vkp_prepare) */
++static void dlss_destroy(void);
 +
 +void vkp_shutdown(void) {
 +    close_semaphore_handles();
@@ -2813,6 +3425,7 @@ index 00000000..e5a5f00a
 +    if (!V.dev && !V.inst) return;
 +    if (V.dev) {
 +        vkDeviceWaitIdle(V.dev);
++        dlss_destroy();
 +        if (gl.DeleteFramebuffers) destroy_shared();
 +        destroy_swapchain();
 +        if (V.gl_sem_gl_done) gl.DeleteSemaphoresEXT(1, &V.gl_sem_gl_done);
@@ -2827,9 +3440,11 @@ index 00000000..e5a5f00a
 +    if (V.surf) vkDestroySurfaceKHR(V.inst, V.surf, NULL);
 +    if (V.inst) vkDestroyInstance(V.inst, NULL);
 +    if (V.lib) FreeLibrary(V.lib);
++    slb_shutdown();
 +    destroy_child();
 +    memset(&V, 0, sizeof V);
 +    memset(&gl, 0, sizeof gl);
++    memset(&D, 0, sizeof D);
 +}
 +
 +/* Vulkan half: child window, instance, surface, device, swapchain,
@@ -2840,9 +3455,19 @@ index 00000000..e5a5f00a
 +    if (!V.lib) { snprintf(V.status, sizeof V.status, "off (no vulkan-1.dll)"); return 0; }
 +    V.gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(V.lib, "vkGetInstanceProcAddr");
 +    if (!V.gipa) FAIL("vkGetInstanceProcAddr");
++    /* DLSS: everything goes through Streamline's interposer, which adds what
++     * DLSS needs to the instance and device. Without it, DLSS stays off and
++     * the presenter runs as before. */
++    int via_sl = 0;
++    if (s_dlss_want && slb_load()) {
++        PFN_vkGetInstanceProcAddr sl_gipa = (PFN_vkGetInstanceProcAddr)slb_vk_get_instance_proc_addr();
++        if (sl_gipa) { V.gipa = sl_gipa; via_sl = 1; }
++    }
++    if (s_dlss_want && !via_sl) snprintf(D.status, sizeof D.status, "%s", slb_status());
 +    vkCreateInstance = (PFN_vkCreateInstance)(void *)V.gipa(NULL, "vkCreateInstance");
 +    const char *iext[] = { "VK_KHR_surface", "VK_KHR_win32_surface" };
-+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "psxrecomp", 1, "psxrecomp", 1, VK_API_VERSION_1_2 };
++    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "psxrecomp", 1, "psxrecomp", 1,
++                              via_sl ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2 };
 +    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 2, iext };
 +    if (!vkCreateInstance || vkCreateInstance(&ici, NULL, &V.inst) != VK_SUCCESS) FAIL("vkCreateInstance");
 +    if (!load_vk_instance_fns()) FAIL("Vulkan instance functions");
@@ -2884,6 +3509,13 @@ index 00000000..e5a5f00a
 +    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
 +    if (vkCreateFence(V.dev, &fci, NULL, &V.fence) != VK_SUCCESS) FAIL("vkCreateFence");
 +    if (!create_semaphores_vk()) FAIL("exportable semaphores");
++    if (via_sl) {
++        if (vkAllocateCommandBuffers(V.dev, &cai, &D.cb) == VK_SUCCESS &&
++            vkCreateFence(V.dev, &fci, NULL, &D.fence) == VK_SUCCESS &&
++            slb_device_ready(V.inst, V.pd, V.dev))
++            D.ready = 1;
++        snprintf(D.status, sizeof D.status, "%s", slb_status());
++    }
 +    int r = create_swapchain();
 +    if (r == 0) {
 +        snprintf(V.status, sizeof V.status, "off (swapchain on the game window failed: VkResult %d)", (int)s_sc_err);
@@ -2943,11 +3575,16 @@ index 00000000..e5a5f00a
 +    if (V.on && pick_mode(s_want_interval) != V.mode) V.sc_stale = 1;
 +}
 +
++static void barrier_cb(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
++                       uint32_t src_q, uint32_t dst_q, VkAccessFlags src_a, VkAccessFlags dst_a,
++                       VkPipelineStageFlags src_s, VkPipelineStageFlags dst_s) {
++    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, src_a, dst_a, from, to, src_q, dst_q, img,
++                               { aspect, 0, 1, 0, 1 } };
++    vkCmdPipelineBarrier(cb, src_s, dst_s, 0, 0, NULL, 0, NULL, 1, &b);
++}
 +static void barrier(VkImage img, VkImageLayout from, VkImageLayout to, uint32_t src_q, uint32_t dst_q,
 +                    VkAccessFlags src_a, VkAccessFlags dst_a, VkPipelineStageFlags src_s, VkPipelineStageFlags dst_s) {
-+    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, src_a, dst_a, from, to, src_q, dst_q, img,
-+                               { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-+    vkCmdPipelineBarrier(V.cb, src_s, dst_s, 0, 0, NULL, 0, NULL, 1, &b);
++    barrier_cb(V.cb, img, VK_IMAGE_ASPECT_COLOR_BIT, from, to, src_q, dst_q, src_a, dst_a, src_s, dst_s);
 +}
 +
 +void vkp_present(void) {
@@ -3045,6 +3682,292 @@ index 00000000..e5a5f00a
 +    }
 +}
 +
++/* ---- DLSS ------------------------------------------------------------------ */
++
++/* Exportable Vulkan image + GL import (same recipe as the window image). */
++static const char *shimg_create(ShImg *s, VkFormat fmt, GLenum_ gl_fmt, int w, int h,
++                                VkImageUsageFlags usage, VkImageAspectFlags aspect) {
++    memset(s, 0, sizeof *s);
++    s->fmt = fmt; s->usage = usage; s->aspect = aspect;
++    VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL,
++                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &emi, 0, VK_IMAGE_TYPE_2D, fmt,
++                             { (uint32_t)w, (uint32_t)h, 1 }, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
++                             usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
++    if (vkCreateImage(V.dev, &ii, NULL, &s->img) != VK_SUCCESS) return "vkCreateImage";
++    VkMemoryRequirements mr;
++    vkGetImageMemoryRequirements(V.dev, s->img, &mr);
++    uint32_t mt = find_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt == UINT32_MAX) return "memory type";
++    VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, s->img, VK_NULL_HANDLE };
++    VkExportMemoryAllocateInfo ex = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &ded,
++                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ex, mr.size, mt };
++    if (vkAllocateMemory(V.dev, &ai, NULL, &s->mem) != VK_SUCCESS) return "vkAllocateMemory";
++    if (vkBindImageMemory(V.dev, s->img, s->mem, 0) != VK_SUCCESS) return "vkBindImageMemory";
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, s->img, VK_IMAGE_VIEW_TYPE_2D, fmt,
++                                 { 0, 0, 0, 0 }, { aspect, 0, 1, 0, 1 } };
++    if (vkCreateImageView(V.dev, &vi, NULL, &s->view) != VK_SUCCESS) return "vkCreateImageView";
++    VkMemoryGetWin32HandleInfoKHR hi = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR, NULL, s->mem,
++                                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    HANDLE h_mem = NULL;
++    if (vkGetMemoryWin32HandleKHR(V.dev, &hi, &h_mem) != VK_SUCCESS) return "vkGetMemoryWin32HandleKHR";
++    static char err[96];
++    GLenum_ e1, e2;
++    while (gl.GetError() != 0) {}
++    gl.CreateMemoryObjectsEXT(1, &s->gl_mem);
++    const GLint_ dedicated = 1;
++    gl.MemoryObjectParameterivEXT(s->gl_mem, VKP_GL_DEDICATED_MEMORY_OBJECT, &dedicated);
++    gl.ImportMemoryWin32HandleEXT(s->gl_mem, mr.size, VKP_GL_HANDLE_TYPE_OPAQUE_WIN32, h_mem);
++    e1 = gl.GetError();
++    CloseHandle(h_mem);
++    gl.GenTextures(1, &s->gl_tex);
++    gl.BindTexture(VKP_GL_TEXTURE_2D, s->gl_tex);
++    gl.TexStorageMem2DEXT(VKP_GL_TEXTURE_2D, 1, gl_fmt, w, h, s->gl_mem, 0);
++    e2 = gl.GetError();
++    gl.BindTexture(VKP_GL_TEXTURE_2D, 0);
++    if (e1 || e2) {
++        snprintf(err, sizeof err, "GL import of format %d: import 0x%X, storage 0x%X, size %llu",
++                 (int)fmt, (unsigned)e1, (unsigned)e2, (unsigned long long)mr.size);
++        return err;
++    }
++    return NULL;
++}
++static void shimg_destroy(ShImg *s) {
++    if (s->gl_tex) gl.DeleteTextures(1, &s->gl_tex);
++    if (s->gl_mem) gl.DeleteMemoryObjectsEXT(1, &s->gl_mem);
++    if (s->view) vkDestroyImageView(V.dev, s->view, NULL);
++    if (s->img) vkDestroyImage(V.dev, s->img, NULL);
++    if (s->mem) vkFreeMemory(V.dev, s->mem, NULL);
++    memset(s, 0, sizeof *s);
++}
++
++static void dlss_destroy_inputs(void) {
++    if (D.in_fbo) { gl.DeleteFramebuffers(1, &D.in_fbo); D.in_fbo = 0; }
++    shimg_destroy(&D.in_color); shimg_destroy(&D.in_depth); shimg_destroy(&D.in_mvec);
++    D.in_w = D.in_h = 0;
++}
++static void dlss_destroy_output(void) {
++    if (D.out_view) vkDestroyImageView(V.dev, D.out_view, NULL);
++    if (D.out_img) vkDestroyImage(V.dev, D.out_img, NULL);
++    if (D.out_mem) vkFreeMemory(V.dev, D.out_mem, NULL);
++    D.out_view = 0; D.out_img = 0; D.out_mem = 0;
++    D.out_w = D.out_h = 0; D.out_valid = 0;
++}
++static void dlss_destroy(void) {
++    if (!V.dev) return;
++    if (gl.DeleteFramebuffers) dlss_destroy_inputs();
++    dlss_destroy_output();
++    if (D.fence) { vkDestroyFence(V.dev, D.fence, NULL); D.fence = 0; }
++}
++
++static int dlss_create_inputs(int w, int h) {
++    const char *e;
++    const VkImageUsageFlags cu = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
++                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    const VkImageUsageFlags du = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++    if ((e = shimg_create(&D.in_color, VK_FORMAT_R8G8B8A8_UNORM, VKP_GL_RGBA8, w, h, cu, VK_IMAGE_ASPECT_COLOR_BIT)) ||
++        (e = shimg_create(&D.in_depth, VK_FORMAT_D24_UNORM_S8_UINT, VKP_GL_DEPTH24_STENCIL8, w, h, du, VK_IMAGE_ASPECT_DEPTH_BIT)) ||
++        (e = shimg_create(&D.in_mvec, VK_FORMAT_R16G16B16A16_SFLOAT, VKP_GL_RGBA16F, w, h, cu, VK_IMAGE_ASPECT_COLOR_BIT))) {
++        snprintf(D.status, sizeof D.status, "off (DLSS inputs %dx%d: %s)", w, h, e);
++        return 0;
++    }
++    gl.GenFramebuffers(1, &D.in_fbo);
++    gl.BindFramebuffer(VKP_GL_FRAMEBUFFER, D.in_fbo);
++    gl.FramebufferTexture2D(VKP_GL_FRAMEBUFFER, VKP_GL_COLOR_ATTACHMENT0, VKP_GL_TEXTURE_2D, D.in_color.gl_tex, 0);
++    gl.FramebufferTexture2D(VKP_GL_FRAMEBUFFER, VKP_GL_COLOR_ATTACHMENT1, VKP_GL_TEXTURE_2D, D.in_mvec.gl_tex, 0);
++    gl.FramebufferTexture2D(VKP_GL_FRAMEBUFFER, VKP_GL_DEPTH_STENCIL_ATTACHMENT, VKP_GL_TEXTURE_2D, D.in_depth.gl_tex, 0);
++    GLenum_ st = gl.CheckFramebufferStatus(VKP_GL_FRAMEBUFFER);
++    gl.BindFramebuffer(VKP_GL_FRAMEBUFFER, 0);
++    if (st != VKP_GL_FRAMEBUFFER_COMPLETE) {
++        snprintf(D.status, sizeof D.status, "off (DLSS input framebuffer status 0x%X)", (unsigned)st);
++        return 0;
++    }
++    D.in_w = w; D.in_h = h;
++    return 1;
++}
++static int dlss_create_output(int w, int h) {
++    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
++                             { (uint32_t)w, (uint32_t)h, 1 }, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
++                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                             VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
++    if (vkCreateImage(V.dev, &ii, NULL, &D.out_img) != VK_SUCCESS) goto fail;
++    VkMemoryRequirements mr;
++    vkGetImageMemoryRequirements(V.dev, D.out_img, &mr);
++    uint32_t mt = find_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt == UINT32_MAX) goto fail;
++    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt };
++    if (vkAllocateMemory(V.dev, &ai, NULL, &D.out_mem) != VK_SUCCESS) goto fail;
++    if (vkBindImageMemory(V.dev, D.out_img, D.out_mem, 0) != VK_SUCCESS) goto fail;
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, D.out_img, VK_IMAGE_VIEW_TYPE_2D,
++                                 VK_FORMAT_R8G8B8A8_UNORM, { 0, 0, 0, 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    if (vkCreateImageView(V.dev, &vi, NULL, &D.out_view) != VK_SUCCESS) goto fail;
++    D.out_w = w; D.out_h = h; D.out_valid = 0;
++    return 1;
++fail:
++    snprintf(D.status, sizeof D.status, "off (DLSS output %dx%d)", w, h);
++    return 0;
++}
++
++static void dlss_wait(void) {
++    if (D.fence_pending) {
++        vkWaitForFences(V.dev, 1, &D.fence, VK_TRUE, UINT64_MAX);
++        vkResetFences(V.dev, 1, &D.fence);
++        D.fence_pending = 0;
++    }
++}
++
++void vkp_set_dlss(int on) { s_dlss_want = on ? 1 : 0; }
++
++int vkp_dlss_configure(int in_w, int in_h, int out_w, int out_h) {
++    if (!V.on || !D.ready || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0) return 0;
++    int mode = slb_dlss_configure((uint32_t)in_w, (uint32_t)in_h, (uint32_t)out_w, (uint32_t)out_h);
++    snprintf(D.status, sizeof D.status, "%s", slb_status());
++    if (!mode) return 0;
++    if (in_w != D.in_w || in_h != D.in_h || out_w != D.out_w || out_h != D.out_h) {
++        gl.Finish();
++        dlss_wait();
++        vkDeviceWaitIdle(V.dev);
++        /* Setup can fail transiently (seen once, on the first run after a
++         * build, as a GL import error); try again on later frames, and only
++         * give DLSS up for the session after a few failures. */
++        if (in_w != D.in_w || in_h != D.in_h) {
++            dlss_destroy_inputs();
++            if (!dlss_create_inputs(in_w, in_h)) {
++                dlss_destroy_inputs();
++                if (++D.create_fails >= 3) D.ready = 0;
++                return 0;
++            }
++        }
++        if (out_w != D.out_w || out_h != D.out_h) {
++            dlss_destroy_output();
++            if (!dlss_create_output(out_w, out_h)) {
++                dlss_destroy_output();
++                if (++D.create_fails >= 3) D.ready = 0;
++                return 0;
++            }
++        }
++        D.force_reset = 1;
++    }
++    D.mode = mode;
++    return mode;
++}
++
++unsigned vkp_dlss_input_fbo(void) { return D.ready ? D.in_fbo : 0u; }
++
++int vkp_dlss_run(const VkpDlssFrame *f) {
++    if (!V.on || !D.ready || !D.in_fbo || !D.out_img) return 0;
++    if (f->lw != D.out_w || f->lh != D.out_h) return 0;
++    /* GL: inputs written, window image holds the GL-presented frame. */
++    GLuint_ tex[4] = { D.in_color.gl_tex, D.in_depth.gl_tex, D.in_mvec.gl_tex, V.gl_tex };
++    GLenum_ to_vk[4] = { VKP_GL_LAYOUT_SHADER_READ_ONLY, VKP_GL_LAYOUT_DEPTH_STENCIL_READ_ONLY,
++                         VKP_GL_LAYOUT_SHADER_READ_ONLY, VKP_GL_LAYOUT_TRANSFER_DST };
++    gl.SignalSemaphoreEXT(V.gl_sem_gl_done, 0, NULL, 4, tex, to_vk);
++    gl.Flush();
++    dlss_wait();
++
++    const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++    const VkPipelineStageFlags all = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++    const VkImageLayout ro = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    const VkImageLayout dro = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
++    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
++                                    VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    vkResetCommandBuffer(D.cb, 0);
++    vkBeginCommandBuffer(D.cb, &bi);
++    /* Acquire from GL. */
++    barrier_cb(D.cb, D.in_color.img, VK_IMAGE_ASPECT_COLOR_BIT, ro, ro, VK_QUEUE_FAMILY_EXTERNAL, V.qfi,
++               0, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, all);
++    barrier_cb(D.cb, D.in_depth.img, ds, dro, dro, VK_QUEUE_FAMILY_EXTERNAL, V.qfi,
++               0, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, all);
++    barrier_cb(D.cb, D.in_mvec.img, VK_IMAGE_ASPECT_COLOR_BIT, ro, ro, VK_QUEUE_FAMILY_EXTERNAL, V.qfi,
++               0, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, all);
++    barrier_cb(D.cb, V.sh_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_EXTERNAL, V.qfi,
++               0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++
++    const int evaluate = !D.out_valid || !D.have_last || f->render_id != D.last_render || f->reset || D.force_reset;
++    int ok = 1;
++    if (evaluate) {
++        barrier_cb(D.cb, D.out_img, VK_IMAGE_ASPECT_COLOR_BIT,
++                   D.out_valid ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
++                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_ACCESS_TRANSFER_READ_BIT,
++                   VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, all);
++        SlbFrame sf;
++        memset(&sf, 0, sizeof sf);
++        sf.color = (SlbImage){ (void *)D.in_color.img, (void *)D.in_color.view, (uint32_t)D.in_color.fmt, (uint32_t)ro,
++                               (uint32_t)D.in_color.usage, (uint32_t)D.in_w, (uint32_t)D.in_h };
++        sf.depth = (SlbImage){ (void *)D.in_depth.img, (void *)D.in_depth.view, (uint32_t)D.in_depth.fmt, (uint32_t)dro,
++                               (uint32_t)D.in_depth.usage, (uint32_t)D.in_w, (uint32_t)D.in_h };
++        sf.mvec = (SlbImage){ (void *)D.in_mvec.img, (void *)D.in_mvec.view, (uint32_t)D.in_mvec.fmt, (uint32_t)ro,
++                              (uint32_t)D.in_mvec.usage, (uint32_t)D.in_w, (uint32_t)D.in_h };
++        sf.output = (SlbImage){ (void *)D.out_img, (void *)D.out_view, (uint32_t)VK_FORMAT_R8G8B8A8_UNORM,
++                                (uint32_t)VK_IMAGE_LAYOUT_GENERAL,
++                                (uint32_t)(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT),
++                                (uint32_t)D.out_w, (uint32_t)D.out_h };
++        sf.in_x = 0; sf.in_y = 0; sf.in_w = (uint32_t)D.in_w; sf.in_h = (uint32_t)D.in_h;
++        sf.out_w = (uint32_t)D.out_w; sf.out_h = (uint32_t)D.out_h;
++        sf.jitter_x = f->jitter_x; sf.jitter_y = f->jitter_y;
++        sf.mvec_scale_x = f->mvec_scale_x; sf.mvec_scale_y = f->mvec_scale_y;
++        sf.reset = f->reset || D.force_reset || !D.have_last;
++        sf.frame_index = ++D.frame_index;
++        ok = slb_dlss_evaluate((void *)D.cb, &sf);
++        if (ok) {
++            D.out_valid = 1; D.have_last = 1; D.last_render = f->render_id; D.force_reset = 0; D.evals++;
++        } else {
++            D.fails++; D.out_valid = 0;
++            snprintf(D.status, sizeof D.status, "%s", slb_status());
++        }
++    } else {
++        D.reuses++;
++    }
++    if (ok) {
++        barrier_cb(D.cb, D.out_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_ACCESS_SHADER_WRITE_BIT,
++                   VK_ACCESS_TRANSFER_READ_BIT, all, VK_PIPELINE_STAGE_TRANSFER_BIT);
++        /* Output is top-down; the window image is GL bottom-up: flip into the
++         * letterbox rectangle. Same size, so NEAREST is exact. */
++        VkImageBlit blit = { { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, 0, 0 }, { D.out_w, D.out_h, 1 } },
++                             { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++                             { { f->lx, f->ly + f->lh, 0 }, { f->lx + f->lw, f->ly, 1 } } };
++        vkCmdBlitImage(D.cb, D.out_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.sh_img,
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
++        barrier_cb(D.cb, D.out_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
++                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_ACCESS_TRANSFER_READ_BIT, 0,
++                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    }
++    /* Release everything back to GL. */
++    barrier_cb(D.cb, D.in_color.img, VK_IMAGE_ASPECT_COLOR_BIT, ro, ro, V.qfi, VK_QUEUE_FAMILY_EXTERNAL,
++               VK_ACCESS_SHADER_READ_BIT, 0, all, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    barrier_cb(D.cb, D.in_depth.img, ds, dro, dro, V.qfi, VK_QUEUE_FAMILY_EXTERNAL,
++               VK_ACCESS_SHADER_READ_BIT, 0, all, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    barrier_cb(D.cb, D.in_mvec.img, VK_IMAGE_ASPECT_COLOR_BIT, ro, ro, V.qfi, VK_QUEUE_FAMILY_EXTERNAL,
++               VK_ACCESS_SHADER_READ_BIT, 0, all, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    barrier_cb(D.cb, V.sh_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, V.qfi, VK_QUEUE_FAMILY_EXTERNAL,
++               VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    vkEndCommandBuffer(D.cb);
++    VkPipelineStageFlags ws = all;
++    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &V.gl_done, &ws, 1, &D.cb, 1, &V.vk_done };
++    if (vkQueueSubmit(V.queue, 1, &si, D.fence) == VK_SUCCESS) D.fence_pending = 1;
++    /* GL: wait for Vulkan, then carry on (OSD, present). */
++    GLenum_ to_gl[4] = { VKP_GL_LAYOUT_SHADER_READ_ONLY, VKP_GL_LAYOUT_DEPTH_STENCIL_READ_ONLY,
++                         VKP_GL_LAYOUT_SHADER_READ_ONLY, VKP_GL_LAYOUT_COLOR_ATTACHMENT };
++    gl.WaitSemaphoreEXT(V.gl_sem_vk_done, 0, NULL, 4, tex, to_gl);
++    return ok;
++}
++
++const char *vkp_dlss_status(void) {
++    static char buf[512];
++    if (!s_dlss_want) return "off (not requested)";
++    snprintf(buf, sizeof buf, "%s; evaluated %llu, reused %llu, failed %llu, setup failures %d",
++             D.status[0] ? D.status : "off", D.evals, D.reuses, D.fails, D.create_fails);
++    return buf;
++}
++
 +#else  /* !PSX_VK_PRESENTER: inert */
 +
 +int vkp_prepare(struct SDL_Window *win) { (void)win; return 0; }
@@ -3054,5 +3977,10 @@ index 00000000..e5a5f00a
 +void vkp_set_vsync(int interval) { (void)interval; }
 +void vkp_shutdown(void) {}
 +const char *vkp_status(void) { return "off (not built: PSX_VK_PRESENTER)"; }
++void vkp_set_dlss(int on) { (void)on; }
++int vkp_dlss_configure(int in_w, int in_h, int out_w, int out_h) { (void)in_w; (void)in_h; (void)out_w; (void)out_h; return 0; }
++unsigned vkp_dlss_input_fbo(void) { return 0u; }
++int vkp_dlss_run(const VkpDlssFrame *f) { (void)f; return 0; }
++const char *vkp_dlss_status(void) { return "off (not built: PSX_VK_PRESENTER)"; }
 +
 +#endif

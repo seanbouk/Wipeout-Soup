@@ -90,3 +90,6 @@ starvation_dump.jsonl
 /game.negcon.local.toml
 
 /game.wide.local.toml
+
+# Wipeout Soup: Streamline runtime DLLs (tools/soup/fetch_streamline.py)
+/third_party/streamline/bin/

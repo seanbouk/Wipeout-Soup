@@ -1,6 +1,6 @@
 # Phase 4 plan: Streamline / DLSS hand-off
 
-Status: **4a done** (2026-10-17, [vulkan-presenter.md](vulkan-presenter.md)); 4b next. Follows motion-vector Phases 0–3
+Status: **4a done** (2026-10-17, [vulkan-presenter.md](vulkan-presenter.md)); **4b done** (2026-10-17, [dlss.md](dlss.md)); 4c optional. Follows motion-vector Phases 0–3
 ([plan](motion-vectors-plan.md)), which produced everything DLSS consumes:
 per-pixel depth, motion vectors and a history-reset flag.
 

@@ -88,13 +88,28 @@ target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/widescreen_m
 # Wipeout Soup: scene depth for post-process tools (ReShade).
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/scene_depth_mod.c")
 
-# Wipeout Soup: Vulkan presenter (Windows). The framework's vk_presenter.c is
-# inert unless PSX_VK_PRESENTER is defined; it needs only the vendored Vulkan
-# headers (the loader comes with the driver).
+# Wipeout Soup: Vulkan presenter + DLSS (Windows). The framework's
+# vk_presenter.c / sl_bridge.cpp are inert unless PSX_VK_PRESENTER /
+# PSX_STREAMLINE are defined; they need only the vendored Vulkan and Streamline
+# headers (the Vulkan loader comes with the driver; Streamline's signed DLLs
+# are fetched by tools/soup/fetch_streamline.py and copied next to the exe).
+function(soup_vulkan_presenter target)
+    target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_presenter_mod.c")
+    target_include_directories(${target} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/streamline/include")
+    target_compile_definitions(${target} PRIVATE PSX_VK_PRESENTER=1 PSX_STREAMLINE=1)
+    set(sl_bin "${CMAKE_CURRENT_SOURCE_DIR}/third_party/streamline/bin")
+    foreach(dll sl.interposer.dll sl.common.dll sl.dlss.dll nvngx_dlss.dll)
+        if(EXISTS "${sl_bin}/${dll}")
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${sl_bin}/${dll}" "$<TARGET_FILE_DIR:${target}>"
+                VERBATIM)
+        endif()
+    endforeach()
+endfunction()
 if(WIN32)
-    target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_presenter_mod.c")
-    target_include_directories(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include")
-    target_compile_definitions(psx-runtime PRIVATE PSX_VK_PRESENTER=1)
+    soup_vulkan_presenter(psx-runtime)
 endif()
 
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/track_distance_experimental.c")
@@ -115,8 +130,6 @@ if(TARGET psx-runtime-pgxp)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ship_distance_mod.c"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/negcon_mod.c")
     if(WIN32)
-        target_sources(psx-runtime-pgxp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_presenter_mod.c")
-        target_include_directories(psx-runtime-pgxp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include")
-        target_compile_definitions(psx-runtime-pgxp PRIVATE PSX_VK_PRESENTER=1)
+        soup_vulkan_presenter(psx-runtime-pgxp)
     endif()
 endif()

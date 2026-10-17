@@ -39,19 +39,27 @@ static void note_object(CPUState *cpu, uint32_t address) {
     psx_mv_object(cpu->gpr[4]);
 }
 
+/* Scene depth + motion vectors, armed once (Scene Depth's motion option and
+ * the Vulkan presenter's DLSS option both need them). */
+void soup_arm_scene_motion(void) {
+    static int armed = 0;
+    gl_renderer_set_depth_output(1);
+    if (armed) return;
+    armed = 1;
+    gl_renderer_set_motion_output(1);
+    psx_mv_enable(1);
+    psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80013c78u, note_camera);
+    psx_mod_register_function_entry_plugin("soup.scene-depth", 0x800140acu, note_camera);
+    psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80014ad4u, note_camera);
+    psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80011de8u, note_object);
+    psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80010000u, note_object);
+}
+
 static void activate_scene_depth(void) {
     gl_renderer_set_depth_output(1);
     char motion[16] = "false";
     psx_mod_option_value(PKG, "scene-depth", "motion", motion, sizeof motion);
-    if (!strcmp(motion, "true")) {
-        gl_renderer_set_motion_output(1);
-        psx_mv_enable(1);
-        psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80013c78u, note_camera);
-        psx_mod_register_function_entry_plugin("soup.scene-depth", 0x800140acu, note_camera);
-        psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80014ad4u, note_camera);
-        psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80011de8u, note_object);
-        psx_mod_register_function_entry_plugin("soup.scene-depth", 0x80010000u, note_object);
-    }
+    if (!strcmp(motion, "true")) soup_arm_scene_motion();
 }
 PSX_MOD_CONSTRUCTOR(register_soup_scene_depth) {
     psx_mod_register_activation_plugin("soup.scene-depth", activate_scene_depth);

@@ -17,6 +17,14 @@ description = "The game still renders with OpenGL; each finished frame is handed
 group = "Visual"
 default_enabled = false
 
+[[option]]
+feature = "vulkan-presenter"
+id = "dlss"
+label = "DLSS (experimental)"
+description = "NVIDIA DLSS on RTX cards: rebuilds each frame at your window's resolution from the game's own picture, depth and motion. When the internal resolution already matches the window it runs as DLAA (anti-aliasing only). Turn the internal resolution down for more speed. Needs the Streamline files next to the game (tools/soup/fetch_streamline.py) and PGXP Precision."
+type = "boolean"
+default = "false"
+
 [[plugin]]
 feature = "vulkan-presenter"
 id = "soup.vulkan-presenter"
