@@ -1,0 +1,22 @@
+format_version = 5
+id = "soup.presentation.vulkan"
+version = "1.0.0"
+name = "Vulkan Presenter (experimental)"
+author = "Wipeout Soup"
+description = "Shows the game through Vulkan instead of OpenGL. The picture is identical; this is the groundwork for DLSS. Falls back to OpenGL automatically if Vulkan isn't available."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SCUS-94351"
+
+[[feature]]
+id = "vulkan-presenter"
+name = "Vulkan Presenter (experimental)"
+description = "The game still renders with OpenGL; each finished frame is handed to Vulkan, which puts it on screen. Needs an NVIDIA (or other) driver with OpenGL/Vulkan memory sharing. ReShade then needs its Vulkan install instead of the OpenGL one."
+group = "Visual"
+default_enabled = false
+
+[[plugin]]
+feature = "vulkan-presenter"
+id = "soup.vulkan-presenter"

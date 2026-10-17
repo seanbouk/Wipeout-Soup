@@ -88,6 +88,15 @@ target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/widescreen_m
 # Wipeout Soup: scene depth for post-process tools (ReShade).
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/scene_depth_mod.c")
 
+# Wipeout Soup: Vulkan presenter (Windows). The framework's vk_presenter.c is
+# inert unless PSX_VK_PRESENTER is defined; it needs only the vendored Vulkan
+# headers (the loader comes with the driver).
+if(WIN32)
+    target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_presenter_mod.c")
+    target_include_directories(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include")
+    target_compile_definitions(psx-runtime PRIVATE PSX_VK_PRESENTER=1)
+endif()
+
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/track_distance_experimental.c")
 
 target_sources(psx-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/ship_distance_mod.c")
@@ -105,4 +114,9 @@ if(TARGET psx-runtime-pgxp)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/track_distance_experimental.c"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ship_distance_mod.c"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/negcon_mod.c")
+    if(WIN32)
+        target_sources(psx-runtime-pgxp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_presenter_mod.c")
+        target_include_directories(psx-runtime-pgxp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include")
+        target_compile_definitions(psx-runtime-pgxp PRIVATE PSX_VK_PRESENTER=1)
+    endif()
 endif()

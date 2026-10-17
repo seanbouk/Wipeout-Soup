@@ -465,10 +465,10 @@ index 5417b288..08fb32de 100644
                    << " unsupported instructions; see unsupported_ops.json. "
                       "No C emitted.\n";
 diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
-index 83d53858..0e43c775 100644
+index 83d53858..82e50afe 100644
 --- a/runtime/include/gpu_gl_renderer.h
 +++ b/runtime/include/gpu_gl_renderer.h
-@@ -138,6 +138,27 @@ int  gl_renderer_get_scanlines(float *strength);
+@@ -138,6 +138,32 @@ int  gl_renderer_get_scanlines(float *strength);
   * path. Textured edge expansion needs the complete mirror surface. */
  void gl_renderer_set_wide_fast(int on);
  
@@ -485,6 +485,11 @@ index 83d53858..0e43c775 100644
 + * data). Set before the renderer initialises; allocates a motion attachment
 + * per render target. Presentation only. */
 +void gl_renderer_set_motion_output(int on);
++/* Present through the Vulkan presenter (vk_presenter.h) instead of GL's own
++ * swap. Set before the renderer initialises; falls back to GL if Vulkan can't
++ * start. The status string is "opengl" or the presenter's own status. */
++void gl_renderer_set_vulkan_presenter(int on);
++const char *gl_renderer_presenter_status(void);
 +int  gl_renderer_get_motion_output(void);
 +/* Debug: write the next `count` presented frames' colour (RGBA8) and motion
 + * (RGBA float: xy = native-pixel motion, z = written flag) into dir as
@@ -600,8 +605,75 @@ index aa55b3aa..662a2906 100644
  
  /* --- observability -------------------------------------------------------- */
  
+diff --git a/runtime/include/vk_presenter.h b/runtime/include/vk_presenter.h
+new file mode 100644
+index 00000000..d3e57863
+--- /dev/null
++++ b/runtime/include/vk_presenter.h
+@@ -0,0 +1,49 @@
++/* Vulkan presenter for the OpenGL renderer (Wipeout Soup Phase 4a).
++ *
++ * The GL renderer keeps rendering exactly as before, but its final present
++ * pass draws into a Vulkan-allocated image that GL imports
++ * (GL_EXT_memory_object_win32). The hand-off uses exported semaphores
++ * (GL_EXT_semaphore_win32), and Vulkan blits that image to a swapchain on the
++ * same window and presents. That puts the frame where Vulkan-only tools
++ * (Streamline / DLSS) can reach it, and gives a real Vulkan swapchain (present
++ * modes) for pacing.
++ *
++ * Windows + PSX_VK_PRESENTER builds only; elsewhere every call is inert and
++ * vkp_init fails, so the GL renderer presents as before. */
++#ifndef PSX_VK_PRESENTER_H
++#define PSX_VK_PRESENTER_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct SDL_Window;
++
++/* Vulkan half: a child window over the game window's client area (Vulkan
++ * and GL can't share one window on NVIDIA), instance, device and swapchain. */
++int  vkp_prepare(struct SDL_Window *win);
++/* GL half (GL context current): import the semaphores and the window-sized
++ * shared image. Runs vkp_prepare itself if it wasn't called. Returns 1 on
++ * success; on failure nothing is left behind and the caller keeps presenting
++ * with GL. */
++int  vkp_init(struct SDL_Window *win);
++/* GL framebuffer to draw the presented frame into (window-sized shared image
++ * with a depth-stencil renderbuffer). Changes when the window is resized. */
++unsigned vkp_fbo(void);
++/* Hand the finished frame to Vulkan and present it. Afterwards the shared image
++ * matches the window's current size (recreated if it changed) and GL waits for
++ * Vulkan to release it before drawing the next frame. */
++void vkp_present(void);
++/* SDL swap-interval semantics: 1 vsync (FIFO), 0 no vsync (MAILBOX: no
++ * waiting and no tearing; immediate if mailbox is missing), -1 adaptive (FIFO
++ * relaxed when available). */
++void vkp_set_vsync(int interval);
++void vkp_shutdown(void);
++/* Debug: one-line status ("off", or device/mode/size). */
++const char *vkp_status(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 96be1f85..7c08b411 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -318,6 +318,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
++    ${PSXRECOMP_ROOT}/runtime/src/vk_presenter.c
+     ${PSXRECOMP_ROOT}/runtime/src/dma_gpu_ll.c
+     ${PSXRECOMP_ROOT}/runtime/src/dma.c
+     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
 diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
-index 1c7bcd72..e2df734c 100644
+index 1c7bcd72..4b50113f 100644
 --- a/runtime/src/debug_server.c
 +++ b/runtime/src/debug_server.c
 @@ -6301,18 +6301,21 @@ static void handle_gte_ring_dump(int id, const char *json)
@@ -639,7 +711,7 @@ index 1c7bcd72..e2df734c 100644
      if (!present_shot_request(path)) {
          send_err(id, "present_shot unavailable (headless, or the Vulkan backend "
                       "which has no present readback)");
-@@ -8991,6 +8998,32 @@ static void handle_present_shot(int id, const char *json)
+@@ -8991,6 +8998,40 @@ static void handle_present_shot(int id, const char *json)
               id, path, present_shot_seq());
  }
  
@@ -659,6 +731,14 @@ index 1c7bcd72..e2df734c 100644
 +    send_fmt("{\"id\":%d,\"ok\":true,%s,%s,\"renderer\":%d,\"capture_left\":%d}",
 +             id, body, gpu, gl_renderer_get_motion_output(), gl_renderer_mv_capture_left());
 +}
++/* presenter — which presenter is live ("opengl" or the Vulkan presenter's
++ * device / present mode / size). */
++static void handle_presenter(int id, const char *json)
++{
++    extern const char *gl_renderer_presenter_status(void);
++    (void)json;
++    send_fmt("{\"id\":%d,\"ok\":true,\"presenter\":\"%s\"}", id, gl_renderer_presenter_status());
++}
 +static void handle_mv_capture(int id, const char *json)
 +{
 +    extern void gl_renderer_mv_capture(const char *dir, int count);
@@ -672,12 +752,13 @@ index 1c7bcd72..e2df734c 100644
  /* present_shot_seq — completion counter for the staged capture above. Sample it
   * before present_shot and poll until it changes; the counter advances on every
   * completion, success or not, so the poll always terminates. `wrote` reports
-@@ -13887,6 +13920,8 @@ static const CmdEntry s_commands[] = {
+@@ -13887,6 +13928,9 @@ static const CmdEntry s_commands[] = {
      { "screenshot_file",   handle_screenshot_file },
      { "screenshot_hires",  handle_screenshot_hires },
      { "present_shot",      handle_present_shot },
 +    { "mv_stats",          handle_mv_stats },
 +    { "mv_capture",        handle_mv_capture },
++    { "presenter",         handle_presenter },
      { "present_shot_seq",  handle_present_shot_seq },
      { "display_ring_get",  handle_display_ring_get },
      { "display_ring_aux",  handle_display_ring_aux },
@@ -782,10 +863,20 @@ index 41490964..db025627 100644
  
  static void gp1_h_display_range(uint32_t val) {
 diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
-index 2bb0e9f6..096d6992 100644
+index 2bb0e9f6..94535040 100644
 --- a/runtime/src/gpu_gl_renderer.c
 +++ b/runtime/src/gpu_gl_renderer.c
-@@ -113,6 +113,9 @@
+@@ -86,7 +86,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include "png_write.h"   /* png_write_rgb — present_shot readback */
++#include "png_write.h"
++#include "vk_presenter.h"   /* optional Vulkan presenter (window framebuffer) */   /* png_write_rgb — present_shot readback */
+ 
+ #ifndef GL_BGRA
+ #define GL_BGRA 0x80E1
+@@ -113,6 +114,9 @@
  #define PSXGL_FRAMEBUFFER_COMPLETE  0x8CD5
  #define PSXGL_RENDERBUFFER          0x8D41
  #define PSXGL_DEPTH24_STENCIL8      0x88F0
@@ -795,7 +886,7 @@ index 2bb0e9f6..096d6992 100644
  #define PSXGL_R16UI                 0x8234
  #define PSXGL_RED_INTEGER           0x8D94
  #define PSXGL_FUNC_ADD              0x8006
-@@ -167,6 +170,7 @@ typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
+@@ -167,6 +171,7 @@ typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
  typedef void   (APIENTRY *PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
  typedef GLenum (APIENTRY *PFN_glCheckFramebufferStatus)(GLenum);
  typedef void   (APIENTRY *PFN_glBlitFramebuffer)(GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLbitfield,GLenum);
@@ -803,7 +894,7 @@ index 2bb0e9f6..096d6992 100644
  typedef void   (APIENTRY *PFN_glGenRenderbuffers)(GLsizei, GLuint *);
  typedef void   (APIENTRY *PFN_glDeleteRenderbuffers)(GLsizei, const GLuint *);
  typedef void   (APIENTRY *PFN_glBindRenderbuffer)(GLenum, GLuint);
-@@ -230,6 +234,7 @@ static PFN_glBindFramebuffer   p_glBindFramebuffer;
+@@ -230,6 +235,7 @@ static PFN_glBindFramebuffer   p_glBindFramebuffer;
  static PFN_glFramebufferTexture2D p_glFramebufferTexture2D;
  static PFN_glCheckFramebufferStatus p_glCheckFramebufferStatus;
  static PFN_glBlitFramebuffer   p_glBlitFramebuffer;
@@ -811,7 +902,7 @@ index 2bb0e9f6..096d6992 100644
  static PFN_glGenQueries          p_glGenQueries;
  static PFN_glDeleteQueries       p_glDeleteQueries;
  static PFN_glBeginQuery          p_glBeginQuery;
-@@ -281,6 +286,7 @@ static int load_modern_gl(void) {
+@@ -281,6 +287,7 @@ static int load_modern_gl(void) {
      LOAD(p_glFramebufferTexture2D, "glFramebufferTexture2D");
      LOAD(p_glCheckFramebufferStatus, "glCheckFramebufferStatus");
      LOAD(p_glBlitFramebuffer, "glBlitFramebuffer");
@@ -819,7 +910,21 @@ index 2bb0e9f6..096d6992 100644
      LOAD(p_glGenRenderbuffers, "glGenRenderbuffers");
      LOAD(p_glDeleteRenderbuffers, "glDeleteRenderbuffers");
      LOAD(p_glBindRenderbuffer, "glBindRenderbuffer");
-@@ -373,8 +379,12 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+@@ -304,6 +311,13 @@ static SDL_Window   *s_win = NULL;
+ static SDL_GLContext s_ctx = NULL;
+ static uint16_t     *s_vram = NULL;       /* CPU VRAM array (gpu.c's storage) */
+ static int           s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) */
++/* The window's framebuffer as far as this renderer is concerned. 0 is GL's
++ * default framebuffer. With the Vulkan presenter it is the FBO on the shared
++ * image Vulkan presents (vk_presenter.h); every "draw to / read from the
++ * window" and every "unbind" in this file binds s_win_fbo, so the GL path is
++ * unchanged when it is 0. */
++static GLuint        s_win_fbo = 0;
++static int           s_vkp_want = 0, s_vkp_on = 0;
+ 
+ static int           s_scale = 1;          /* internal-res scale (hr FBO) */
+ /* Netplay: SW@1× + GPU@s_scale dual write; CPU VRAM always authoritative. */
+@@ -373,8 +387,12 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
   * q is the perspective weight ([video] perspective_texturing): 0 = affine, the
   * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
   * fragment shader read the noperspective varying — i.e. bit-identical to the
@@ -834,7 +939,7 @@ index 2bb0e9f6..096d6992 100644
  static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
  static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
  
-@@ -387,6 +397,34 @@ static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  *
+@@ -387,6 +405,34 @@ static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  *
  static int     s_pq_valid = 0;                  /* perspective weights present */
  static float   s_pq[3];
  
@@ -869,7 +974,7 @@ index 2bb0e9f6..096d6992 100644
  /* TEX program uniforms. */
  static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
  static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
-@@ -502,6 +540,7 @@ static int s_stencil_valid = 1;
+@@ -502,6 +548,7 @@ static int s_stencil_valid = 1;
  #define WIDE_MAX_SURF 4
  static GLuint s_wide_tex[WIDE_MAX_SURF];     /* color tex per surface (0 = free) */
  static GLuint s_wide_fbo[WIDE_MAX_SURF];     /* FBO per surface */
@@ -877,7 +982,45 @@ index 2bb0e9f6..096d6992 100644
  static GLuint s_wide_rb[WIDE_MAX_SURF];      /* depth-stencil RB per surface (mask
                                                * mirror, same as hr). PERF-CRITICAL:
                                                * a stencil-less wide FBO made every
-@@ -1020,24 +1059,30 @@ static const char *GEO_VS =
+@@ -720,7 +767,7 @@ static void hold_ensure_tex(int w, int h) {
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hold_fbo);
+     p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0,
+                              GL_TEXTURE_2D, s_hold_tex, 0);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     s_hold_tw = w;
+     s_hold_th = h;
+ }
+@@ -735,7 +782,7 @@ static void hold_capture_drawable(void) {
+     if (ww < 1 || wh < 1)
+         return;
+     hold_ensure_tex(ww, wh);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+     glBindTexture(GL_TEXTURE_2D, s_hold_tex);
+     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, ww, wh);
+     glBindTexture(GL_TEXTURE_2D, 0);
+@@ -758,8 +805,8 @@ static void hold_capture_native_fbo(GLuint src_fbo, int dx, int dy, int dw, int
+     p_glBlitFramebuffer(dx * S, dy * S, (dx + dw) * S, (dy + dh) * S,
+                         0, 0, dw * S, dh * S,
+                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
+     s_hold_kind = HOLD_NATIVE;
+     s_hold_force_4_3 = force_4_3 ? 1 : 0;
+     s_hold_linear = linear ? 1 : 0;
+@@ -845,7 +892,7 @@ static void pres_record(int path, int dx, int dy, int w, int h,
+         glReadPixels((dx + w / 2) * s_scale, (dy + h / 2) * s_scale,
+                      1, 1, GL_RGB, GL_UNSIGNED_BYTE, sp);
+         glPixelStorei(GL_PACK_ALIGNMENT, 4);
+-        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+         e->src_valid = 1;
+     }
+     e->src_r = sp[0]; e->src_g = sp[1]; e->src_b = sp[2];
+@@ -1020,24 +1067,30 @@ static const char *GEO_VS =
      "#version 330\n"
      "layout(location=0) in vec2 a_pos;\n"
      "layout(location=1) in vec4 a_col;\n"
@@ -914,7 +1057,7 @@ index 2bb0e9f6..096d6992 100644
  
  /* Textured prims: sample raw 1555 VRAM (integer), CLUT decode per depth,
   * texture window, optional bilinear, texel-0 discard, STP-split discard,
-@@ -1062,6 +1107,8 @@ static const char *TEX_VS =
+@@ -1062,6 +1115,8 @@ static const char *TEX_VS =
      "layout(location=7) in vec4 a_limits;\n"
      "layout(location=8) in float a_semi;\n"
      "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
@@ -923,7 +1066,7 @@ index 2bb0e9f6..096d6992 100644
      "uniform float u_shift;\n"
      "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
      "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
-@@ -1072,6 +1119,14 @@ static const char *TEX_VS =
+@@ -1072,6 +1127,14 @@ static const char *TEX_VS =
      "flat out int v_persp;\n"
      "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
      "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
@@ -938,7 +1081,7 @@ index 2bb0e9f6..096d6992 100644
      "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
      "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
      "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
-@@ -1080,19 +1135,17 @@ static const char *TEX_VS =
+@@ -1080,19 +1143,17 @@ static const char *TEX_VS =
      "  v_limits = ivec4(floor(a_limits + 0.5));\n"
      "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
      "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
@@ -963,7 +1106,7 @@ index 2bb0e9f6..096d6992 100644
  static const char *TEX_FS =
      "#version 330\n"
      "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
-@@ -1104,6 +1157,8 @@ static const char *TEX_FS =
+@@ -1104,6 +1165,8 @@ static const char *TEX_FS =
      "flat in int v_raw;       /* 1 = no color modulation */\n"
      "flat in ivec4 v_limits;  /* prim uv sampling bounds (inclusive, post-wrap) */\n"
      "flat in int v_semi;      /* GP0 command has semi-transparency enabled */\n"
@@ -972,7 +1115,7 @@ index 2bb0e9f6..096d6992 100644
      "uniform usampler2D u_vram;\n"
      "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
      "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
-@@ -1176,6 +1231,7 @@ static const char *TEX_FS =
+@@ -1176,6 +1239,7 @@ static const char *TEX_FS =
      "  }\n"
      "  if (u_semipass == 1 && stp == 1) discard;\n"
      "  if (u_semipass == 2 && stp == 0) discard;\n"
@@ -980,7 +1123,7 @@ index 2bb0e9f6..096d6992 100644
      "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
      "  float dst_factor = 0.0;\n"
      "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
-@@ -1350,10 +1406,72 @@ static void hr_end(void) {
+@@ -1350,9 +1414,71 @@ static void hr_end(void) {
          p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
      glDisable(GL_STENCIL_TEST);
      glDisable(GL_SCISSOR_TEST);
@@ -990,8 +1133,9 @@ index 2bb0e9f6..096d6992 100644
 +    }
      p_glBindVertexArray(0);
      p_glUseProgram(0);
-     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
- }
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
++}
 +/* Arm scene-depth writes for a batch whose prims carry depth (see s_depth_out).
 + * The depth test is the only way GL writes depth, so it is enabled with
 + * GL_ALWAYS; clamping replaces near/far clipping so depth can never cull a
@@ -1049,11 +1193,37 @@ index 2bb0e9f6..096d6992 100644
 +        buf = PSXGL_COLOR_ATTACHMENT0;
 +        p_glDrawBuffers(1, &buf);
 +    }
-+}
+ }
  
  /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
- /* CPU-side VRAM writes (GP0 A0 transfers, DMA, single pixel pokes) land in
-@@ -1738,6 +1856,8 @@ static int   s_tb_n = 0;                    /* verts queued */
+@@ -1468,7 +1594,7 @@ static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h
+     glDisable(GL_STENCIL_TEST);
+     p_glBindVertexArray(0);
+     p_glUseProgram(0);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+ }
+ 
+ static void rebuild_mask_stencils(void) {
+@@ -1507,7 +1633,7 @@ static void pack_flush(void) {
+     p_glBindVertexArray(0);
+     p_glUseProgram(0);
+     glDisable(GL_SCISSOR_TEST);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+ }
+ 
+ /* Make sure the raw mirror is current for a textured draw that samples the
+@@ -1552,7 +1678,7 @@ static void ensure_cpu(void) {
+     pack_flush();
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
+     glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, s_vram);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+     s_gpu_dirty = 0;
+     coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
+ }
+@@ -1738,6 +1864,8 @@ static int   s_tb_n = 0;                    /* verts queued */
  static int   s_tb_semi = -2;
  static int   s_tb_mask = 0, s_tb_filter = 0;
  static int   s_tb_twin[4] = {0, 0, 0, 0};
@@ -1062,7 +1232,7 @@ index 2bb0e9f6..096d6992 100644
  static uint64_t s_batch_total = 0, s_batch_reason[7];
  
  void gl_renderer_batch_diag(uint64_t out[8]) {
-@@ -1802,6 +1922,10 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+@@ -1802,6 +1930,10 @@ static void tex_batch_draw_passes(int nverts, int semi) {
          p_glUniform1i(s_uSemipass, 2);
          glDrawArrays(GL_TRIANGLES, 0, nverts);
      }
@@ -1073,7 +1243,7 @@ index 2bb0e9f6..096d6992 100644
  }
  
  /* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
-@@ -1856,6 +1980,7 @@ static void flush_tex_batch(void) {
+@@ -1856,6 +1988,7 @@ static void flush_tex_batch(void) {
      p_glBindVertexArray(s_tex_vao);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
      p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -1081,7 +1251,7 @@ index 2bb0e9f6..096d6992 100644
  
      tex_batch_draw_passes(nverts, semi);
  
-@@ -1883,16 +2008,18 @@ static void flush_tex_batch(void) {
+@@ -1883,16 +2016,18 @@ static void flush_tex_batch(void) {
   * GP0(68h) 1x1 dots; each was two immediate gpu_triangle draws (BufferData +
   * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
  #define FLATBATCH_MAXV 8190                 /* multiple of 3 */
@@ -1102,7 +1272,7 @@ index 2bb0e9f6..096d6992 100644
          if (x < flo) flo = x; if (x > fhi) fhi = x;
      }
      /* floor/ceil rather than a truncating cast — see mirror_batch_center_only. */
-@@ -1910,9 +2037,11 @@ static void flush_flat_batch(void) {
+@@ -1910,9 +2045,11 @@ static void flush_flat_batch(void) {
      p_glUseProgram(s_geo_prog);
      p_glBindVertexArray(s_geo_vao);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -1115,7 +1285,7 @@ index 2bb0e9f6..096d6992 100644
  
      if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
          !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts))) {
-@@ -1922,7 +2051,10 @@ static void flush_flat_batch(void) {
+@@ -1922,7 +2059,10 @@ static void flush_flat_batch(void) {
          gl_perf_mirror_begin();
          wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
          wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
@@ -1127,7 +1297,7 @@ index 2bb0e9f6..096d6992 100644
          wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
          wide_target_end(s_geo_uXoff, s_geo_uXhalf);
          gl_perf_mirror_end();
-@@ -1943,15 +2075,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1943,15 +2083,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
      /* Lines stay immediate (rare); tris batch for MotK 0x68 starfields. */
      if (mode != GL_TRIANGLES || n < 3) {
          flush_flat_batch();
@@ -1153,7 +1323,7 @@ index 2bb0e9f6..096d6992 100644
          }
          hr_begin(1);
          if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
-@@ -1960,7 +2095,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1960,7 +2103,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
          p_glUseProgram(s_geo_prog);
          p_glBindVertexArray(s_geo_vao);
          p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -1162,7 +1332,7 @@ index 2bb0e9f6..096d6992 100644
                         verts, PSXGL_STREAM_DRAW);
          glDrawArrays(mode, 0, n);
          if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
-@@ -1979,22 +2114,30 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -1979,22 +2122,30 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
          return;
      }
  
@@ -1195,7 +1365,7 @@ index 2bb0e9f6..096d6992 100644
          s_fb_n++;
      }
  }
-@@ -2092,8 +2235,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+@@ -2092,8 +2243,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
              s_batch_reason[reason]++;
              flush_tex_batch();
          }
@@ -1211,7 +1381,7 @@ index 2bb0e9f6..096d6992 100644
              s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
              s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
          }
-@@ -2110,6 +2260,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+@@ -2110,6 +2268,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
              vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
              vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
              vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
@@ -1221,7 +1391,7 @@ index 2bb0e9f6..096d6992 100644
          }
          s_tb_n += 3;
          if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
-@@ -2128,9 +2281,10 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int
+@@ -2128,9 +2289,10 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int
      float b = (((c >> 10) & 0x1F) << 3) / 255.0f;
      float a = s_mask_set ? 1.0f : 0.0f;
      float fx0 = (float)wx, fy0 = (float)y, fx1 = (float)(wx + ww), fy1 = (float)(y + h);
@@ -1235,7 +1405,7 @@ index 2bb0e9f6..096d6992 100644
      };
      /* Wide target: positions already wide-space so u_xoff = 0; full-width
       * scissor; u_xhalf = g_wide_w/2. */
-@@ -2225,6 +2379,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b)
+@@ -2225,6 +2387,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b)
      glClearStencil(0);
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1243,7 +1413,27 @@ index 2bb0e9f6..096d6992 100644
      rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
  }
  
-@@ -2375,6 +2530,30 @@ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float
+@@ -2249,7 +2412,7 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
+     if (h2)       fill_segment(x, 0, w1, h2, r, g, b);
+     if (w2 && h2) fill_segment(0, 0, w2, h2, r, g, b);
+     glDisable(GL_SCISSOR_TEST);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     if (!s_cpu_auth_dual)
+         s_gpu_dirty = 1;
+     coh_record(GL_COH_FILL, x, y, x + w - 1, y + h - 1);
+@@ -2280,8 +2443,8 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+     p_glBlitFramebuffer(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
+                         sx*S, sy*S, (sx+w)*S, (sy+h)*S,
+                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
+ 
+     hr_begin(0);   /* copies ignore the draw area */
+     glScissor(dx*S, dy*S, w*S, h*S);
+@@ -2375,6 +2538,30 @@ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float
      s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
      sw_set_perspective_triangle(enabled, q0, q1, q2);
  }
@@ -1274,7 +1464,7 @@ index 2bb0e9f6..096d6992 100644
  static void glb_set_draw_area(int x1,int y1,int x2,int y2) { flush_flat_batch(); flush_tex_batch(); s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
  static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
  static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_batch(); s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
-@@ -2385,7 +2564,7 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
+@@ -2385,7 +2572,7 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
   * SW @ 1× for authority, then GPU @ s_scale for present quality. */
  /* The sub-pixel / perspective override describes exactly one triangle; drop it
   * once that triangle has been submitted so a later prim can never inherit it. */
@@ -1283,7 +1473,7 @@ index 2bb0e9f6..096d6992 100644
  
  static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
      if (s_cpu_auth_dual || !s_raster_ok)
-@@ -2538,6 +2717,7 @@ static void depth24_clear_skipped_fb(void) {
+@@ -2538,6 +2725,7 @@ static void depth24_clear_skipped_fb(void) {
      glClearStencil(0);
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1291,7 +1481,25 @@ index 2bb0e9f6..096d6992 100644
      if (s_raw_fbo) {
          p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
          glViewport(0, 0, VRAM_W, VRAM_H);
-@@ -2810,6 +2990,18 @@ static int init_gpu_raster(void) {
+@@ -2545,7 +2733,7 @@ static void depth24_clear_skipped_fb(void) {
+         glClear(GL_COLOR_BUFFER_BIT);
+     }
+     glDisable(GL_SCISSOR_TEST);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     rect_add(&s_pack_dirty, x0, y0, x1, y1);
+     present_dirty_rect(x0, y0, x1, y1, 1);
+     rect_clear(&s_d24_skip_fb);
+@@ -2763,7 +2951,7 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
+         p_glFramebufferRenderbuffer(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT,
+                                     PSXGL_RENDERBUFFER, stencil_rb);
+     GLenum st = p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     if (st != PSXGL_FRAMEBUFFER_COMPLETE) {
+         fprintf(stdout, "psxrecomp: GL FBO incomplete (0x%X)\n", st);
+         return 0;
+@@ -2810,6 +2998,18 @@ static int init_gpu_raster(void) {
      p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
  
      if (!make_fbo(&s_hr_fbo, s_hr_tex, s_hr_rb)) return 0;
@@ -1305,12 +1513,12 @@ index 2bb0e9f6..096d6992 100644
 +            glDeleteTextures(1, &s_mv_tex); s_mv_tex = 0;
 +            s_mv_out = 0;
 +        }
-+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
 +    }
      if (!make_fbo(&s_raw_fbo, s_raw_tex, 0)) return 0;
      if (!make_fbo(&s_scratch_fbo, s_scratch_tex, 0)) return 0;
  
-@@ -2824,6 +3016,8 @@ static int init_gpu_raster(void) {
+@@ -2824,6 +3024,8 @@ static int init_gpu_raster(void) {
      s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
      s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
      s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
@@ -1319,7 +1527,7 @@ index 2bb0e9f6..096d6992 100644
      s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
      s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
      s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
-@@ -2877,10 +3071,14 @@ static int init_gpu_raster(void) {
+@@ -2877,10 +3079,14 @@ static int init_gpu_raster(void) {
      p_glBindVertexArray(s_geo_vao);
      p_glGenBuffers(1, &s_geo_vbo);
      p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -1336,7 +1544,7 @@ index 2bb0e9f6..096d6992 100644
  
      p_glGenVertexArrays(1, &s_tex_vao);
      p_glBindVertexArray(s_tex_vao);
-@@ -2898,6 +3096,8 @@ static int init_gpu_raster(void) {
+@@ -2898,6 +3104,8 @@ static int init_gpu_raster(void) {
          p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
          p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
          p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
@@ -1345,15 +1553,17 @@ index 2bb0e9f6..096d6992 100644
      }
  
      p_glGenVertexArrays(1, &s_blit_vao);
-@@ -2919,6 +3119,7 @@ static int init_gpu_raster(void) {
+@@ -2919,7 +3127,8 @@ static int init_gpu_raster(void) {
      glClearStencil(0);
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
 +    scene_aux_clear();
-     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
      rect_clear(&s_pack_dirty);
      s_up_nrects = 0;
-@@ -2954,6 +3155,7 @@ int gl_renderer_init_context(SDL_Window *win) {
+     up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
+@@ -2954,6 +3163,7 @@ int gl_renderer_init_context(SDL_Window *win) {
      s_present_h = 0;
      SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
      SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -1361,7 +1571,67 @@ index 2bb0e9f6..096d6992 100644
      s_ctx = SDL_GL_CreateContext(win);
      if (!s_ctx) { fprintf(stdout, "psxrecomp: GL context creation failed (%s)\n", SDL_GetError()); return 0; }
      if (SDL_GL_MakeCurrent(win, s_ctx) != 0) { fprintf(stdout, "psxrecomp: MakeCurrent failed (%s)\n", SDL_GetError()); SDL_GL_DeleteContext(s_ctx); s_ctx=NULL; return 0; }
-@@ -3357,6 +3559,7 @@ static void wide_free_all(void) {
+@@ -2967,6 +3177,15 @@ int gl_renderer_init_context(SDL_Window *win) {
+     glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+     const char *ver = (const char *)glGetString(GL_VERSION);
+     fprintf(stdout, "psxrecomp: OpenGL context created (%s)\n", ver ? ver : "?");
++    if (s_vkp_want) {
++        vkp_set_vsync(s_swap_interval);
++        if (vkp_init(win)) {
++            s_vkp_on = 1;
++            s_win_fbo = vkp_fbo();
++            SDL_GL_SetSwapInterval(0);           /* GL no longer presents */
++        }
++        fprintf(stdout, "psxrecomp: presenter: %s\n", vkp_status());
++    }
+ 
+     /* All-or-nothing: any missing entry point / failed shader / bad FBO means
+      * the whole GL renderer is unavailable and the runtime stays on the pure
+@@ -3035,6 +3254,7 @@ int gl_renderer_init_context(SDL_Window *win) {
+  * exists. Adaptive falls back to vsync if unsupported. */
+ void gl_renderer_set_swap_interval(int interval) {
+     s_swap_interval = interval;
++    if (s_vkp_on) { vkp_set_vsync(interval); return; }
+     if (s_ctx) {
+         if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0) {
+             SDL_GL_SetSwapInterval(1);
+@@ -3043,7 +3263,17 @@ void gl_renderer_set_swap_interval(int interval) {
+     }
+ }
+ 
++/* Present through Vulkan (vk_presenter.h) instead of GL. Set before the
++ * renderer initialises; falls back to GL if Vulkan can't start. */
++void gl_renderer_set_vulkan_presenter(int on) { s_vkp_want = on ? 1 : 0; }
++const char *gl_renderer_presenter_status(void) { return s_vkp_on ? vkp_status() : "opengl"; }
++
+ void gl_renderer_shutdown(void) {
++    if (s_vkp_on) {
++        vkp_shutdown();
++        s_vkp_on = 0;
++        s_win_fbo = 0;
++    }
+     if (s_ctx) {
+         ensure_cpu();
+         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
+@@ -3269,7 +3499,7 @@ int gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out) {
+     glPixelStorei(GL_PACK_ALIGNMENT, 2);
+     glReadPixels(x, y, w, h, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, out);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+     return 1;
+ }
+ 
+@@ -3292,7 +3522,7 @@ int gl_renderer_vram_diff(uint32_t *count, int bbox[4],
+     coh_record(GL_COH_DIFF, 0, 0, VRAM_W - 1, VRAM_H - 1);
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
+     glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, tmp);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+     uint32_t n = 0;
+     int x0 = VRAM_W, y0 = VRAM_H, x1 = -1, y1 = -1, ns = 0;
+     for (int y = 0; y < VRAM_H; y++) {
+@@ -3357,6 +3587,7 @@ static void wide_free_all(void) {
          if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
          if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
          if (s_wide_rb[i])  { p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0; }
@@ -1369,7 +1639,7 @@ index 2bb0e9f6..096d6992 100644
          s_wide_base[i] = -1;
      }
      g_wide_cur = 0;
-@@ -3387,11 +3590,19 @@ static GLuint wide_fbo_for(int base_x) {
+@@ -3387,12 +3618,20 @@ static GLuint wide_fbo_for(int base_x) {
              }
              /* Clear to black so unwritten margins are clean (not stale). */
              p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_wide_fbo[i]);
@@ -1384,21 +1654,26 @@ index 2bb0e9f6..096d6992 100644
              glClearStencil(0);
              glStencilMask(0xFF);
 -            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+-            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
 +            glClearDepth(1.0);
 +            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 +            scene_aux_clear();
-             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
              s_wide_base[i] = base_x;
              return s_wide_fbo[i];
-@@ -3454,6 +3665,7 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
+         }
+@@ -3454,8 +3693,9 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
      glClearStencil((color >> 15) & 1);   /* stencil mirrors bit15, like the color alpha */
      glStencilMask(0xFF);
      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 +    scene_aux_clear();
      glDisable(GL_SCISSOR_TEST);
-     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
      gl_perf_mirror_end();
-@@ -3493,10 +3705,13 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
+     s_cw_wide_ms += cw_ms() - t0;
+ }
+@@ -3493,13 +3733,16 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
      if (sides & 1) {
          glScissor(0, y0, margin, y1 - y0);
          glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1411,8 +1686,57 @@ index 2bb0e9f6..096d6992 100644
 +        scene_aux_clear();
      }
      glDisable(GL_SCISSOR_TEST);
-     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
-@@ -4105,6 +4320,11 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     gl_perf_mirror_end();
+     s_cw_wide_ms += cw_ms() - t0;
+ }
+@@ -3546,7 +3789,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+     glReadPixels(0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+ 
+     /* Orientation: the wide FBO stores PS1 y inverted (geo shader maps vram_y=0
+      * to NDC y=-1 = FBO BOTTOM), and glReadPixels reads bottom-up — the two
+@@ -3590,7 +3833,7 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+     glReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+     /* Same orientation reasoning as glb_render_wide_display: glReadPixels row 0 =
+      * PS1 top scanline, so copy straight (top-down). */
+     int count = 0;
+@@ -3928,7 +4171,7 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
+     glBindTexture(GL_TEXTURE_2D, s_interp_tex[dst]);
+     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                         x * s_scale, y * s_scale, pw, ph);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+     if (s_interp_valid == 0) {
+         s_interp_cur = dst;
+         s_interp_valid = 1;
+@@ -3946,7 +4189,7 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
+ 
+ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
+     int prev = s_interp_prev, curr = s_interp_cur;
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     glViewport(lx, ly, lw, lh);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, s_interp_tex[prev]);
+@@ -4077,7 +4320,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+     if (vx + dw > ww) dw = ww - vx;
+     if (vy + dh > wh) dh = wh - vy;
+     if (dw < 1 || dh < 1) return;
+-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
+     glDisable(GL_SCISSOR_TEST);
+     glDisable(GL_STENCIL_TEST);
+     glDisable(GL_DEPTH_TEST);
+@@ -4105,6 +4348,11 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
  }
  
  /* Composite host toast + volume bar into the default framebuffer, then swap. */
@@ -1424,7 +1748,14 @@ index 2bb0e9f6..096d6992 100644
  static void gl_swap_with_osd(void) {
      if (s_present_prog && s_ctx) {
          int ww = 0, wh = 0;
-@@ -4157,9 +4377,28 @@ static void gl_swap_with_osd(void) {
+@@ -4151,15 +4399,35 @@ static void gl_swap_with_osd(void) {
+         extern void present_shot_done(int ok);
+         char shot_path[512];
+         if (present_shot_take(shot_path, (int)sizeof(shot_path))) {
++            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
+             int ww = 0, wh = 0;
+             int wrote = 0;
+             SDL_GL_GetDrawableSize(s_win, &ww, &wh);
              if (ww > 0 && wh > 0) {
                  uint8_t *rows = (uint8_t *)malloc((size_t)ww * wh * 3);
                  uint8_t *flip = rows ? (uint8_t *)malloc((size_t)ww * wh * 3) : NULL;
@@ -1454,7 +1785,7 @@ index 2bb0e9f6..096d6992 100644
                      for (int y = 0; y < wh; y++)
                          memcpy(flip + (size_t)y * ww * 3,
                                 rows + (size_t)(wh - 1 - y) * ww * 3,
-@@ -4174,6 +4413,7 @@ static void gl_swap_with_osd(void) {
+@@ -4174,9 +4442,20 @@ static void gl_swap_with_osd(void) {
                  free(flip);
                  free(rows);
              }
@@ -1462,7 +1793,29 @@ index 2bb0e9f6..096d6992 100644
              present_shot_done(wrote);
          }
      }
-@@ -4240,6 +4480,87 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
++    if (s_vkp_on) {
++        vkp_present();
++        s_win_fbo = vkp_fbo();                    /* new FBO after a resize */
++        if (!s_win_fbo) {                         /* Vulkan gave up: back to GL */
++            s_vkp_on = 0;
++            SDL_GL_SetSwapInterval(s_swap_interval);
++            fprintf(stdout, "psxrecomp: presenter: %s; using OpenGL\n", vkp_status());
++        }
++        return;
++    }
+     SDL_GL_SwapWindow(s_win);
+ }
+ 
+@@ -4184,7 +4463,7 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+                                 int x, int y, int w, int h, int linear,
+                                 int lx, int ly, int lw, int lh, int v_flip) {
+     float u0, v0, u1, v1;
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     /* Optional solid-background extension for native 4:3 UI inside a wide
+      * window. Only side panels within the configured aspect are colored. */
+     uint16_t background;
+@@ -4240,6 +4519,87 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
      p_glUseProgram(0);
  }
  
@@ -1475,7 +1828,7 @@ index 2bb0e9f6..096d6992 100644
 +                                int lx, int ly, int lw, int lh) {
 +    if (!s_depth_out) return;
 +    const int S = s_scale;
-+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
 +    glDisable(GL_SCISSOR_TEST);
 +    glDepthMask(GL_TRUE);
 +    glClearDepth(1.0);
@@ -1484,7 +1837,7 @@ index 2bb0e9f6..096d6992 100644
 +    p_glBlitFramebuffer(x * S, y * S, (x + w) * S, (y + h) * S,
 +                        lx, ly + lh, lx + lw, ly,
 +                        GL_DEPTH_BUFFER_BIT, GL_NEAREST);
-+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
 +    /* Detection marker: ReShade's Generic Depth add-on (v6.8,
 +     * generic_depth_addon.cpp "Skip unused") ignores any depth buffer that saw
 +     * 3 or fewer vertices drawn in a frame, and the window's only draw is the
@@ -1527,7 +1880,7 @@ index 2bb0e9f6..096d6992 100644
 +        glReadBuffer(PSXGL_COLOR_ATTACHMENT1);
 +        glReadPixels(x * S, y * S, W, H, GL_RGBA, GL_FLOAT, mv);
 +        glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
-+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
 +        char path[600];
 +        FILE *f;
 +        snprintf(path, sizeof path, "%s/f%04d.rgba", s_mvcap_dir, s_mvcap_seq);
@@ -1550,7 +1903,25 @@ index 2bb0e9f6..096d6992 100644
  /* Bezel art: a still image behind the frame, filling whatever the letterbox or
   * pillarbox leaves over. It never samples the frame, so unlike an edge-stretch
   * backdrop it is independent of what the game is currently drawing. */
-@@ -4397,6 +4718,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+@@ -4270,7 +4630,7 @@ int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
+ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
+     if (!s_bezel_tex || ww <= 0 || wh <= 0) return;
+     if (lx <= 0 && ly <= 0 && lw >= ww && lh >= wh) return;
+-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_win_fbo);
+     glDisable(GL_SCISSOR_TEST);
+     glDisable(GL_BLEND);
+     glViewport(0, 0, ww, wh);
+@@ -4374,7 +4734,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+      * display mode (e.g. 216/224-line menus) must fill the rect as before.
+      * The FMV band fix lives in the depth24/CPU present paths only. */
+ 
+-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
+     glDisable(GL_SCISSOR_TEST);
+     glViewport(0, 0, ww, wh);
+     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
+@@ -4397,6 +4757,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
      present_bezel(ww, wh, lx, ly, lw, lh);
      present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                          disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
@@ -1559,11 +1930,13 @@ index 2bb0e9f6..096d6992 100644
      pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4439,7 +4762,22 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
+@@ -4439,9 +4801,24 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
                          (base_x + native_w) * S, VRAM_H * S,
                          g_wide_off * S, 0,
                          (g_wide_off + native_w) * S, VRAM_H * S,
 -                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 +                        GL_COLOR_BUFFER_BIT |
 +                            (s_depth_out ? GL_DEPTH_BUFFER_BIT : 0),
 +                        GL_NEAREST);
@@ -1580,10 +1953,21 @@ index 2bb0e9f6..096d6992 100644
 +        glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
 +        p_glDrawBuffers(1, &buf);
 +    }
-     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
-     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_win_fbo);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
  }
-@@ -4501,6 +4839,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+ 
+ /* GPU-direct native-wide present: blit the displayed buffer's wide FBO straight
+@@ -4480,7 +4857,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
+ 
+-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_win_fbo);
+     glDisable(GL_SCISSOR_TEST);
+     glViewport(0, 0, ww, wh);
+     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
+@@ -4501,6 +4878,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
      }
      present_target_quad(tex, g_wide_w, VRAM_H,
                          0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1);
@@ -1592,7 +1976,7 @@ index 2bb0e9f6..096d6992 100644
      pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
      hold_capture_drawable();
      latency_ring_mark(LAT_SWAP_BEGIN);
-@@ -4524,6 +4864,8 @@ static const GpuRenderBackend GL_BACKEND = {
+@@ -4524,6 +4903,8 @@ static const GpuRenderBackend GL_BACKEND = {
      .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
      .set_precise_triangle = glb_set_precise_triangle,
      .set_perspective_triangle = glb_set_perspective_triangle,
@@ -2010,3 +2394,665 @@ index 52c57bca..134c5d8a 100644
  extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
                                         int32_t int_x, int32_t int_y,
                                         int32_t *x16, int32_t *y16,
+diff --git a/runtime/src/vk_presenter.c b/runtime/src/vk_presenter.c
+new file mode 100644
+index 00000000..e5a5f00a
+--- /dev/null
++++ b/runtime/src/vk_presenter.c
+@@ -0,0 +1,656 @@
++/* vk_presenter.c — Vulkan presenter for the OpenGL renderer. See vk_presenter.h.
++ *
++ * Frame protocol (binary semaphores, both exported to GL):
++ *   GL draws the frame into the shared image, then glSignalSemaphoreEXT(gl_done)
++ *   -> Vulkan waits gl_done + the swapchain acquire, blits shared -> swapchain
++ *      image (Y-flipped: GL rows are bottom-up), signals vk_done and the
++ *      per-image present semaphore, presents
++ *   -> GL glWaitSemaphoreEXT(vk_done) before it touches the shared image again.
++ * Every gl_done signal is matched by exactly one Vulkan wait, even when the
++ * acquire fails, so the binary semaphores never double-signal.
++ *
++ * Vulkan presents to a CHILD window laid over the game window's client area,
++ * not to the game window itself. On NVIDIA a window can't carry both the GL
++ * context and a Vulkan swapchain: with GL first, swapchain creation fails
++ * (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR); with Vulkan first, wglMakeCurrent
++ * fails. The child is input-transparent (HTTRANSPARENT, disabled), so mouse
++ * and keyboard still reach the game window, and it is resized to match the
++ * client area on every present.
++ *
++ * Vulkan is loaded at runtime from vulkan-1.dll (no link dependency). The
++ * headers come from the game project (PSX_VK_PRESENTER builds only). */
++#include "vk_presenter.h"
++
++#if defined(PSX_VK_PRESENTER) && defined(_WIN32)
++
++#define VK_NO_PROTOTYPES
++#define VK_USE_PLATFORM_WIN32_KHR
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <vulkan/vulkan.h>
++#include <SDL3/SDL.h>
++#include <stdio.h>
++#include <string.h>
++
++/* ---- GL entry points this file needs (loaded through SDL) ---------------- */
++typedef unsigned int GLenum_, GLuint_; typedef int GLint_, GLsizei_; typedef unsigned long long GLuint64_;
++#define VKP_GL_TEXTURE_2D 0x0DE1
++#define VKP_GL_RGBA8 0x8058
++#define VKP_GL_FRAMEBUFFER 0x8D40
++#define VKP_GL_COLOR_ATTACHMENT0 0x8CE0
++#define VKP_GL_DEPTH_STENCIL_ATTACHMENT 0x821A
++#define VKP_GL_RENDERBUFFER 0x8D41
++#define VKP_GL_DEPTH24_STENCIL8 0x88F0
++#define VKP_GL_FRAMEBUFFER_COMPLETE 0x8CD5
++#define VKP_GL_HANDLE_TYPE_OPAQUE_WIN32 0x9587
++#define VKP_GL_DEDICATED_MEMORY_OBJECT 0x9581
++#define VKP_GL_LAYOUT_COLOR_ATTACHMENT 0x958E
++#define VKP_GL_LAYOUT_TRANSFER_SRC 0x9592
++#define VKP_GL_NUM_EXTENSIONS 0x821D
++#define VKP_GL_EXTENSIONS 0x1F03
++static struct {
++    void (APIENTRY *CreateMemoryObjectsEXT)(GLsizei_, GLuint_ *);
++    void (APIENTRY *DeleteMemoryObjectsEXT)(GLsizei_, const GLuint_ *);
++    void (APIENTRY *MemoryObjectParameterivEXT)(GLuint_, GLenum_, const GLint_ *);
++    void (APIENTRY *ImportMemoryWin32HandleEXT)(GLuint_, GLuint64_, GLenum_, void *);
++    void (APIENTRY *TexStorageMem2DEXT)(GLenum_, GLsizei_, GLenum_, GLsizei_, GLsizei_, GLuint_, GLuint64_);
++    void (APIENTRY *GenSemaphoresEXT)(GLsizei_, GLuint_ *);
++    void (APIENTRY *DeleteSemaphoresEXT)(GLsizei_, const GLuint_ *);
++    void (APIENTRY *ImportSemaphoreWin32HandleEXT)(GLuint_, GLenum_, void *);
++    void (APIENTRY *SignalSemaphoreEXT)(GLuint_, GLuint_, const GLuint_ *, GLuint_, const GLuint_ *, const GLenum_ *);
++    void (APIENTRY *WaitSemaphoreEXT)(GLuint_, GLuint_, const GLuint_ *, GLuint_, const GLuint_ *, const GLenum_ *);
++    void (APIENTRY *GenFramebuffers)(GLsizei_, GLuint_ *);
++    void (APIENTRY *DeleteFramebuffers)(GLsizei_, const GLuint_ *);
++    void (APIENTRY *BindFramebuffer)(GLenum_, GLuint_);
++    void (APIENTRY *FramebufferTexture2D)(GLenum_, GLenum_, GLenum_, GLuint_, GLint_);
++    void (APIENTRY *FramebufferRenderbuffer)(GLenum_, GLenum_, GLenum_, GLuint_);
++    GLenum_ (APIENTRY *CheckFramebufferStatus)(GLenum_);
++    void (APIENTRY *GenRenderbuffers)(GLsizei_, GLuint_ *);
++    void (APIENTRY *DeleteRenderbuffers)(GLsizei_, const GLuint_ *);
++    void (APIENTRY *BindRenderbuffer)(GLenum_, GLuint_);
++    void (APIENTRY *RenderbufferStorage)(GLenum_, GLenum_, GLsizei_, GLsizei_);
++    void (APIENTRY *GenTextures)(GLsizei_, GLuint_ *);
++    void (APIENTRY *DeleteTextures)(GLsizei_, const GLuint_ *);
++    void (APIENTRY *BindTexture)(GLenum_, GLuint_);
++    void (APIENTRY *Flush)(void);
++    void (APIENTRY *Finish)(void);
++    void (APIENTRY *GetIntegerv)(GLenum_, GLint_ *);
++    const unsigned char *(APIENTRY *GetStringi)(GLenum_, GLuint_);
++    GLenum_ (APIENTRY *GetError)(void);
++} gl;
++
++/* ---- Vulkan state ---------------------------------------------------------- */
++#define VKP_MAX_IMAGES 8
++static struct {
++    int on;
++    HMODULE lib;
++    PFN_vkGetInstanceProcAddr gipa;
++    VkInstance inst;
++    VkPhysicalDevice pd;
++    VkDevice dev;
++    VkQueue queue;
++    uint32_t qfi;
++    VkSurfaceKHR surf;
++    VkSwapchainKHR sc;
++    VkImage sc_img[VKP_MAX_IMAGES];
++    VkSemaphore present_sem[VKP_MAX_IMAGES];   /* per image: blit done -> present */
++    uint32_t sc_n;
++    VkExtent2D sc_ext;
++    VkPresentModeKHR mode;
++    int sc_stale;
++    /* shared image */
++    int w, h;
++    VkImage sh_img;
++    VkDeviceMemory sh_mem;
++    VkDeviceSize sh_size;
++    GLuint_ gl_mem, gl_tex, gl_fbo, gl_rb;
++    /* hand-off */
++    VkSemaphore gl_done, vk_done, acquire;
++    GLuint_ gl_sem_gl_done, gl_sem_vk_done;
++    VkCommandPool pool;
++    VkCommandBuffer cb;
++    VkFence fence;
++    int fence_pending;
++    char status[256];
++    struct SDL_Window *win;
++} V;
++
++/* Requested swap interval. Outside V: it is set before vkp_init and must
++ * survive vkp_shutdown's reset. */
++static int s_want_interval = 1;
++
++#define VKF(name) static PFN_##name name
++VKF(vkCreateInstance); VKF(vkDestroyInstance); VKF(vkEnumeratePhysicalDevices); VKF(vkGetPhysicalDeviceProperties);
++VKF(vkGetPhysicalDeviceQueueFamilyProperties); VKF(vkCreateDevice); VKF(vkDestroyDevice); VKF(vkGetDeviceProcAddr);
++VKF(vkCreateWin32SurfaceKHR); VKF(vkDestroySurfaceKHR); VKF(vkGetPhysicalDeviceSurfaceSupportKHR);
++VKF(vkGetPhysicalDeviceSurfaceCapabilitiesKHR); VKF(vkGetPhysicalDeviceSurfacePresentModesKHR);
++VKF(vkGetPhysicalDeviceMemoryProperties); VKF(vkEnumerateDeviceExtensionProperties);
++VKF(vkGetDeviceQueue); VKF(vkCreateSwapchainKHR); VKF(vkDestroySwapchainKHR); VKF(vkGetSwapchainImagesKHR);
++VKF(vkCreateImage); VKF(vkDestroyImage); VKF(vkGetImageMemoryRequirements); VKF(vkAllocateMemory); VKF(vkFreeMemory);
++VKF(vkBindImageMemory); VKF(vkGetMemoryWin32HandleKHR); VKF(vkCreateSemaphore); VKF(vkDestroySemaphore);
++VKF(vkGetSemaphoreWin32HandleKHR); VKF(vkCreateCommandPool); VKF(vkDestroyCommandPool); VKF(vkAllocateCommandBuffers);
++VKF(vkBeginCommandBuffer); VKF(vkEndCommandBuffer); VKF(vkResetCommandBuffer); VKF(vkCmdPipelineBarrier);
++VKF(vkCmdBlitImage); VKF(vkQueueSubmit); VKF(vkQueuePresentKHR); VKF(vkAcquireNextImageKHR); VKF(vkCreateFence);
++VKF(vkDestroyFence); VKF(vkWaitForFences); VKF(vkResetFences); VKF(vkDeviceWaitIdle);
++
++/* ---- child window that Vulkan presents to -------------------------------- */
++static HWND s_parent, s_child;
++static LRESULT CALLBACK child_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
++    if (msg == WM_NCHITTEST) return HTTRANSPARENT;    /* input goes to the game window */
++    if (msg == WM_ERASEBKGND) return 1;               /* Vulkan covers every pixel */
++    return DefWindowProcW(h, msg, wp, lp);
++}
++static int create_child(HWND parent) {
++    static ATOM cls = 0;
++    HINSTANCE hi = GetModuleHandleW(NULL);
++    if (!cls) {
++        WNDCLASSEXW wc = { sizeof wc };
++        wc.lpfnWndProc = child_proc;
++        wc.hInstance = hi;
++        wc.lpszClassName = L"PsxRecompVkPresenter";
++        cls = RegisterClassExW(&wc);
++        if (!cls) return 0;
++    }
++    RECT r; GetClientRect(parent, &r);
++    s_child = CreateWindowExW(0, L"PsxRecompVkPresenter", L"", WS_CHILD | WS_VISIBLE | WS_DISABLED,
++                              0, 0, r.right - r.left, r.bottom - r.top, parent, NULL, hi, NULL);
++    if (!s_child) return 0;
++    s_parent = parent;
++    /* GL must not paint over the child (it never presents, but be explicit). */
++    SetWindowLongPtrW(parent, GWL_STYLE, GetWindowLongPtrW(parent, GWL_STYLE) | WS_CLIPCHILDREN);
++    return 1;
++}
++static void sync_child_size(void) {
++    if (!s_child) return;
++    RECT pr, cr; GetClientRect(s_parent, &pr); GetClientRect(s_child, &cr);
++    if (pr.right != cr.right || pr.bottom != cr.bottom)
++        SetWindowPos(s_child, NULL, 0, 0, pr.right, pr.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
++}
++static void destroy_child(void) {
++    if (s_child) { DestroyWindow(s_child); s_child = NULL; }
++}
++
++static int load_gl(void) {
++#define L(f, n) do { *(void **)&gl.f = (void *)SDL_GL_GetProcAddress(n); if (!gl.f) return 0; } while (0)
++    L(CreateMemoryObjectsEXT, "glCreateMemoryObjectsEXT"); L(DeleteMemoryObjectsEXT, "glDeleteMemoryObjectsEXT"); L(MemoryObjectParameterivEXT, "glMemoryObjectParameterivEXT");
++    L(ImportMemoryWin32HandleEXT, "glImportMemoryWin32HandleEXT"); L(TexStorageMem2DEXT, "glTexStorageMem2DEXT");
++    L(GenSemaphoresEXT, "glGenSemaphoresEXT"); L(DeleteSemaphoresEXT, "glDeleteSemaphoresEXT");
++    L(ImportSemaphoreWin32HandleEXT, "glImportSemaphoreWin32HandleEXT");
++    L(SignalSemaphoreEXT, "glSignalSemaphoreEXT"); L(WaitSemaphoreEXT, "glWaitSemaphoreEXT");
++    L(GenFramebuffers, "glGenFramebuffers"); L(DeleteFramebuffers, "glDeleteFramebuffers");
++    L(BindFramebuffer, "glBindFramebuffer"); L(FramebufferTexture2D, "glFramebufferTexture2D");
++    L(FramebufferRenderbuffer, "glFramebufferRenderbuffer"); L(CheckFramebufferStatus, "glCheckFramebufferStatus");
++    L(GenRenderbuffers, "glGenRenderbuffers"); L(DeleteRenderbuffers, "glDeleteRenderbuffers");
++    L(BindRenderbuffer, "glBindRenderbuffer"); L(RenderbufferStorage, "glRenderbufferStorage");
++    L(GenTextures, "glGenTextures"); L(DeleteTextures, "glDeleteTextures"); L(BindTexture, "glBindTexture");
++    L(Flush, "glFlush"); L(Finish, "glFinish"); L(GetIntegerv, "glGetIntegerv"); L(GetStringi, "glGetStringi"); L(GetError, "glGetError");
++#undef L
++    GLint_ n = 0; int mem = 0, sem = 0;
++    gl.GetIntegerv(VKP_GL_NUM_EXTENSIONS, &n);
++    for (GLint_ i = 0; i < n; i++) {
++        const char *e = (const char *)gl.GetStringi(VKP_GL_EXTENSIONS, (GLuint_)i);
++        if (!e) continue;
++        if (!strcmp(e, "GL_EXT_memory_object_win32")) mem = 1;
++        if (!strcmp(e, "GL_EXT_semaphore_win32")) sem = 1;
++    }
++    return mem && sem;
++}
++
++static int load_vk_instance_fns(void) {
++#define I(n) do { *(void **)&n = (void *)V.gipa(V.inst, #n); if (!n) return 0; } while (0)
++    I(vkDestroyInstance); I(vkEnumeratePhysicalDevices); I(vkGetPhysicalDeviceProperties);
++    I(vkGetPhysicalDeviceQueueFamilyProperties); I(vkCreateDevice); I(vkGetDeviceProcAddr);
++    I(vkCreateWin32SurfaceKHR); I(vkDestroySurfaceKHR); I(vkGetPhysicalDeviceSurfaceSupportKHR);
++    I(vkGetPhysicalDeviceSurfaceCapabilitiesKHR); I(vkGetPhysicalDeviceSurfacePresentModesKHR);
++    I(vkGetPhysicalDeviceMemoryProperties); I(vkEnumerateDeviceExtensionProperties);
++#undef I
++    return 1;
++}
++static int load_vk_device_fns(void) {
++#define D(n) do { *(void **)&n = (void *)vkGetDeviceProcAddr(V.dev, #n); if (!n) return 0; } while (0)
++    D(vkDestroyDevice); D(vkGetDeviceQueue); D(vkCreateSwapchainKHR); D(vkDestroySwapchainKHR);
++    D(vkGetSwapchainImagesKHR); D(vkCreateImage); D(vkDestroyImage); D(vkGetImageMemoryRequirements);
++    D(vkAllocateMemory); D(vkFreeMemory); D(vkBindImageMemory); D(vkGetMemoryWin32HandleKHR);
++    D(vkCreateSemaphore); D(vkDestroySemaphore); D(vkGetSemaphoreWin32HandleKHR); D(vkCreateCommandPool);
++    D(vkDestroyCommandPool); D(vkAllocateCommandBuffers); D(vkBeginCommandBuffer); D(vkEndCommandBuffer);
++    D(vkResetCommandBuffer); D(vkCmdPipelineBarrier); D(vkCmdBlitImage); D(vkQueueSubmit); D(vkQueuePresentKHR);
++    D(vkAcquireNextImageKHR); D(vkCreateFence); D(vkDestroyFence); D(vkWaitForFences); D(vkResetFences);
++    D(vkDeviceWaitIdle);
++#undef D
++    return 1;
++}
++
++static uint32_t find_mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
++    VkPhysicalDeviceMemoryProperties mp;
++    vkGetPhysicalDeviceMemoryProperties(V.pd, &mp);
++    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
++    return UINT32_MAX;
++}
++
++static VkPresentModeKHR pick_mode(int interval) {
++    VkPresentModeKHR modes[8]; uint32_t n = 8;
++    if (vkGetPhysicalDeviceSurfacePresentModesKHR(V.pd, V.surf, &n, modes) != VK_SUCCESS) n = 0;
++    /* "No vsync" prefers MAILBOX: never waits for vblank, like immediate, but
++     * never tears either (the newest frame replaces a queued one). That's what
++     * a 60 fps game on a 75 Hz panel wants; GL could only choose tearing. */
++    VkPresentModeKHR want = interval > 0 ? VK_PRESENT_MODE_FIFO_KHR
++                          : interval < 0 ? VK_PRESENT_MODE_FIFO_RELAXED_KHR
++                                         : VK_PRESENT_MODE_MAILBOX_KHR;
++    for (uint32_t i = 0; i < n; i++) if (modes[i] == want) return want;
++    if (interval == 0)
++        for (uint32_t i = 0; i < n; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) return modes[i];
++    return VK_PRESENT_MODE_FIFO_KHR;              /* always available */
++}
++
++static void destroy_swapchain(void) {
++    for (uint32_t i = 0; i < V.sc_n; i++)
++        if (V.present_sem[i]) { vkDestroySemaphore(V.dev, V.present_sem[i], NULL); V.present_sem[i] = 0; }
++    if (V.sc) { vkDestroySwapchainKHR(V.dev, V.sc, NULL); V.sc = 0; }
++    V.sc_n = 0;
++}
++
++/* 1 = created, 0 = failed (V.sc_err says why), -1 = window has no size yet
++ * (hidden or minimised): try again at the next present. */
++static VkResult s_sc_err = VK_SUCCESS;
++static int create_swapchain(void) {
++    VkSurfaceCapabilitiesKHR caps;
++    if ((s_sc_err = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, V.surf, &caps)) != VK_SUCCESS) return 0;
++    if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) return -1;
++    V.mode = pick_mode(s_want_interval);
++    VkSwapchainCreateInfoKHR ci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
++    ci.surface = V.surf;
++    ci.minImageCount = caps.minImageCount + 1;
++    if (caps.maxImageCount && ci.minImageCount > caps.maxImageCount) ci.minImageCount = caps.maxImageCount;
++    ci.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
++    ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++    ci.imageExtent = caps.currentExtent;
++    ci.imageArrayLayers = 1;
++    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    ci.preTransform = caps.currentTransform;
++    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++    ci.presentMode = V.mode;
++    ci.clipped = VK_TRUE;
++    ci.oldSwapchain = V.sc;
++    VkSwapchainKHR sc;
++    if ((s_sc_err = vkCreateSwapchainKHR(V.dev, &ci, NULL, &sc)) != VK_SUCCESS) return 0;
++    destroy_swapchain();
++    V.sc = sc;
++    V.sc_ext = caps.currentExtent;
++    V.sc_n = VKP_MAX_IMAGES;
++    if (vkGetSwapchainImagesKHR(V.dev, V.sc, &V.sc_n, V.sc_img) != VK_SUCCESS) return 0;
++    VkSemaphoreCreateInfo si = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++    for (uint32_t i = 0; i < V.sc_n; i++)
++        if (vkCreateSemaphore(V.dev, &si, NULL, &V.present_sem[i]) != VK_SUCCESS) return 0;
++    V.sc_stale = 0;
++    return 1;
++}
++
++static void destroy_shared(void) {
++    if (V.gl_fbo) { gl.DeleteFramebuffers(1, &V.gl_fbo); V.gl_fbo = 0; }
++    if (V.gl_rb) { gl.DeleteRenderbuffers(1, &V.gl_rb); V.gl_rb = 0; }
++    if (V.gl_tex) { gl.DeleteTextures(1, &V.gl_tex); V.gl_tex = 0; }
++    if (V.gl_mem) { gl.DeleteMemoryObjectsEXT(1, &V.gl_mem); V.gl_mem = 0; }
++    if (V.sh_img) { vkDestroyImage(V.dev, V.sh_img, NULL); V.sh_img = 0; }
++    if (V.sh_mem) { vkFreeMemory(V.dev, V.sh_mem, NULL); V.sh_mem = 0; }
++    V.w = V.h = 0;
++}
++
++/* Window-sized RGBA8 image in exportable Vulkan memory, imported into GL as a
++ * texture behind an FBO (plus a GL-only depth-stencil renderbuffer). Sets
++ * V.status to the failing step. */
++static int create_shared(int w, int h) {
++#define SFAIL(why) do { snprintf(V.status, sizeof V.status, "off (shared image: %s)", why); return 0; } while (0)
++    VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL,
++                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &emi, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
++                             { (uint32_t)w, (uint32_t)h, 1 }, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
++                             /* Every usage GL might put a texture to: the driver picks the
++                              * memory layout from these, and GL assumes its own full set.
++                              * A narrower set gives GL a smaller allocation than it expects
++                              * (glTexStorageMem2DEXT -> GL_OUT_OF_MEMORY). */
++                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
++                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
++    if (vkCreateImage(V.dev, &ii, NULL, &V.sh_img) != VK_SUCCESS) SFAIL("vkCreateImage");
++    VkMemoryRequirements mr;
++    vkGetImageMemoryRequirements(V.dev, V.sh_img, &mr);
++    uint32_t mt = find_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt == UINT32_MAX) SFAIL("no device-local memory type");
++    VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, V.sh_img, VK_NULL_HANDLE };
++    VkExportMemoryAllocateInfo ex = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &ded,
++                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ex, mr.size, mt };
++    if (vkAllocateMemory(V.dev, &ai, NULL, &V.sh_mem) != VK_SUCCESS) SFAIL("vkAllocateMemory");
++    if (vkBindImageMemory(V.dev, V.sh_img, V.sh_mem, 0) != VK_SUCCESS) SFAIL("vkBindImageMemory");
++    V.sh_size = mr.size;
++    VkMemoryGetWin32HandleInfoKHR hi = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR, NULL, V.sh_mem,
++                                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    HANDLE h_mem = NULL;
++    if (vkGetMemoryWin32HandleKHR(V.dev, &hi, &h_mem) != VK_SUCCESS) SFAIL("vkGetMemoryWin32HandleKHR");
++    while (gl.GetError() != 0) {}             /* report this step's errors, not stale ones */
++    gl.CreateMemoryObjectsEXT(1, &V.gl_mem);
++    /* The Vulkan side is a dedicated allocation; GL must be told before import. */
++    const GLint_ dedicated = 1;
++    GLenum_ e[4];
++    gl.MemoryObjectParameterivEXT(V.gl_mem, VKP_GL_DEDICATED_MEMORY_OBJECT, &dedicated);
++    e[0] = gl.GetError();
++    gl.ImportMemoryWin32HandleEXT(V.gl_mem, V.sh_size, VKP_GL_HANDLE_TYPE_OPAQUE_WIN32, h_mem);
++    e[1] = gl.GetError();
++    CloseHandle(h_mem);                        /* GL holds its own reference */
++    gl.GenTextures(1, &V.gl_tex);
++    gl.BindTexture(VKP_GL_TEXTURE_2D, V.gl_tex);
++    gl.TexStorageMem2DEXT(VKP_GL_TEXTURE_2D, 1, VKP_GL_RGBA8, w, h, V.gl_mem, 0);
++    e[2] = gl.GetError();
++    gl.BindTexture(VKP_GL_TEXTURE_2D, 0);
++    gl.GenRenderbuffers(1, &V.gl_rb);
++    gl.BindRenderbuffer(VKP_GL_RENDERBUFFER, V.gl_rb);
++    gl.RenderbufferStorage(VKP_GL_RENDERBUFFER, VKP_GL_DEPTH24_STENCIL8, w, h);
++    e[3] = gl.GetError();
++    gl.BindRenderbuffer(VKP_GL_RENDERBUFFER, 0);
++    gl.GenFramebuffers(1, &V.gl_fbo);
++    gl.BindFramebuffer(VKP_GL_FRAMEBUFFER, V.gl_fbo);
++    gl.FramebufferTexture2D(VKP_GL_FRAMEBUFFER, VKP_GL_COLOR_ATTACHMENT0, VKP_GL_TEXTURE_2D, V.gl_tex, 0);
++    gl.FramebufferRenderbuffer(VKP_GL_FRAMEBUFFER, VKP_GL_DEPTH_STENCIL_ATTACHMENT, VKP_GL_RENDERBUFFER, V.gl_rb);
++    GLenum_ st = gl.CheckFramebufferStatus(VKP_GL_FRAMEBUFFER);
++    gl.BindFramebuffer(VKP_GL_FRAMEBUFFER, 0);
++    V.w = w; V.h = h;
++    if (st != VKP_GL_FRAMEBUFFER_COMPLETE) {
++        snprintf(V.status, sizeof V.status, "off (shared image: GL framebuffer status 0x%X; GL errors dedicated 0x%X import 0x%X storage 0x%X depth 0x%X; size %llu for %dx%d)",
++                 (unsigned)st, (unsigned)e[0], (unsigned)e[1], (unsigned)e[2], (unsigned)e[3],
++                 (unsigned long long)V.sh_size, w, h);
++        return 0;
++    }
++    return 1;
++#undef SFAIL
++}
++
++/* Vulkan half of the semaphore pair: create both exportable semaphores and
++ * keep their Win32 handles until GL imports them. */
++static HANDLE s_sem_handles[2];
++static int create_semaphores_vk(void) {
++    VkExportSemaphoreCreateInfo ex = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, NULL,
++                                       VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    VkSemaphoreCreateInfo xi = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ex, 0 };
++    VkSemaphoreCreateInfo pi = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, NULL, 0 };
++    if (vkCreateSemaphore(V.dev, &xi, NULL, &V.gl_done) != VK_SUCCESS ||
++        vkCreateSemaphore(V.dev, &xi, NULL, &V.vk_done) != VK_SUCCESS ||
++        vkCreateSemaphore(V.dev, &pi, NULL, &V.acquire) != VK_SUCCESS) return 0;
++    VkSemaphoreGetWin32HandleInfoKHR hi = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR, NULL, V.gl_done,
++                                            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT };
++    if (vkGetSemaphoreWin32HandleKHR(V.dev, &hi, &s_sem_handles[0]) != VK_SUCCESS) return 0;
++    hi.semaphore = V.vk_done;
++    if (vkGetSemaphoreWin32HandleKHR(V.dev, &hi, &s_sem_handles[1]) != VK_SUCCESS) return 0;
++    return 1;
++}
++static void import_semaphores_gl(void) {
++    gl.GenSemaphoresEXT(1, &V.gl_sem_gl_done);
++    gl.GenSemaphoresEXT(1, &V.gl_sem_vk_done);
++    gl.ImportSemaphoreWin32HandleEXT(V.gl_sem_gl_done, VKP_GL_HANDLE_TYPE_OPAQUE_WIN32, s_sem_handles[0]);
++    gl.ImportSemaphoreWin32HandleEXT(V.gl_sem_vk_done, VKP_GL_HANDLE_TYPE_OPAQUE_WIN32, s_sem_handles[1]);
++}
++static void close_semaphore_handles(void) {
++    for (int i = 0; i < 2; i++)
++        if (s_sem_handles[i]) { CloseHandle(s_sem_handles[i]); s_sem_handles[i] = NULL; }
++}
++
++static void update_status(void) {
++    VkPhysicalDeviceProperties p;
++    vkGetPhysicalDeviceProperties(V.pd, &p);
++    const char *m = V.mode == VK_PRESENT_MODE_FIFO_KHR ? "fifo" : V.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "fifo-relaxed"
++                  : V.mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : V.mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "?";
++    snprintf(V.status, sizeof V.status, "vulkan %s, %s, %dx%d", p.deviceName, m, V.w, V.h);
++}
++
++static int s_prepared = 0;   /* Vulkan half done (vkp_prepare) */
++
++void vkp_shutdown(void) {
++    close_semaphore_handles();
++    s_prepared = 0;
++    if (!V.dev && !V.inst) return;
++    if (V.dev) {
++        vkDeviceWaitIdle(V.dev);
++        if (gl.DeleteFramebuffers) destroy_shared();
++        destroy_swapchain();
++        if (V.gl_sem_gl_done) gl.DeleteSemaphoresEXT(1, &V.gl_sem_gl_done);
++        if (V.gl_sem_vk_done) gl.DeleteSemaphoresEXT(1, &V.gl_sem_vk_done);
++        if (V.gl_done) vkDestroySemaphore(V.dev, V.gl_done, NULL);
++        if (V.vk_done) vkDestroySemaphore(V.dev, V.vk_done, NULL);
++        if (V.acquire) vkDestroySemaphore(V.dev, V.acquire, NULL);
++        if (V.fence) vkDestroyFence(V.dev, V.fence, NULL);
++        if (V.pool) vkDestroyCommandPool(V.dev, V.pool, NULL);
++        vkDestroyDevice(V.dev, NULL);
++    }
++    if (V.surf) vkDestroySurfaceKHR(V.inst, V.surf, NULL);
++    if (V.inst) vkDestroyInstance(V.inst, NULL);
++    if (V.lib) FreeLibrary(V.lib);
++    destroy_child();
++    memset(&V, 0, sizeof V);
++    memset(&gl, 0, sizeof gl);
++}
++
++/* Vulkan half: child window, instance, surface, device, swapchain,
++ * semaphores. No GL needed, so it can run before or after the GL context. */
++static int prepare_impl(struct SDL_Window *win) {
++#define FAIL(why) do { if (!V.status[0]) snprintf(V.status, sizeof V.status, "off (%s failed)", why); return 0; } while (0)
++    V.lib = LoadLibraryA("vulkan-1.dll");
++    if (!V.lib) { snprintf(V.status, sizeof V.status, "off (no vulkan-1.dll)"); return 0; }
++    V.gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(V.lib, "vkGetInstanceProcAddr");
++    if (!V.gipa) FAIL("vkGetInstanceProcAddr");
++    vkCreateInstance = (PFN_vkCreateInstance)(void *)V.gipa(NULL, "vkCreateInstance");
++    const char *iext[] = { "VK_KHR_surface", "VK_KHR_win32_surface" };
++    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "psxrecomp", 1, "psxrecomp", 1, VK_API_VERSION_1_2 };
++    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 2, iext };
++    if (!vkCreateInstance || vkCreateInstance(&ici, NULL, &V.inst) != VK_SUCCESS) FAIL("vkCreateInstance");
++    if (!load_vk_instance_fns()) FAIL("Vulkan instance functions");
++    HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
++    if (!hwnd || !create_child(hwnd)) FAIL("creating the presenter child window");
++    VkWin32SurfaceCreateInfoKHR sci = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR, NULL, 0, GetModuleHandleW(NULL), s_child };
++    if (vkCreateWin32SurfaceKHR(V.inst, &sci, NULL, &V.surf) != VK_SUCCESS) FAIL("vkCreateWin32SurfaceKHR");
++    /* Device: prefer discrete; needs a graphics queue that can present here. */
++    VkPhysicalDevice pds[8]; uint32_t npd = 8;
++    if (vkEnumeratePhysicalDevices(V.inst, &npd, pds) != VK_SUCCESS || npd == 0) FAIL("vkEnumeratePhysicalDevices");
++    int best = -1;
++    for (uint32_t i = 0; i < npd; i++) {
++        VkQueueFamilyProperties qf[16]; uint32_t nq = 16;
++        vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, qf);
++        for (uint32_t q = 0; q < nq; q++) {
++            VkBool32 sup = VK_FALSE;
++            vkGetPhysicalDeviceSurfaceSupportKHR(pds[i], q, V.surf, &sup);
++            if (!(qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) || !sup) continue;
++            VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pds[i], &p);
++            int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
++            if (score > best) { best = score; V.pd = pds[i]; V.qfi = q; }
++            break;
++        }
++    }
++    if (best < 0) FAIL("finding a GPU that can present to the window");
++    float prio = 1.0f;
++    VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.qfi, 1, &prio };
++    const char *dext[] = { "VK_KHR_swapchain", "VK_KHR_external_memory_win32", "VK_KHR_external_semaphore_win32" };
++    VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 3, dext, NULL };
++    if (vkCreateDevice(V.pd, &dci, NULL, &V.dev) != VK_SUCCESS) FAIL("vkCreateDevice");
++    if (!load_vk_device_fns()) FAIL("Vulkan device functions");
++    vkGetDeviceQueue(V.dev, V.qfi, 0, &V.queue);
++    VkCommandPoolCreateInfo cpi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
++                                    VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, V.qfi };
++    if (vkCreateCommandPool(V.dev, &cpi, NULL, &V.pool) != VK_SUCCESS) FAIL("vkCreateCommandPool");
++    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, V.pool,
++                                        VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
++    if (vkAllocateCommandBuffers(V.dev, &cai, &V.cb) != VK_SUCCESS) FAIL("vkAllocateCommandBuffers");
++    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
++    if (vkCreateFence(V.dev, &fci, NULL, &V.fence) != VK_SUCCESS) FAIL("vkCreateFence");
++    if (!create_semaphores_vk()) FAIL("exportable semaphores");
++    int r = create_swapchain();
++    if (r == 0) {
++        snprintf(V.status, sizeof V.status, "off (swapchain on the game window failed: VkResult %d)", (int)s_sc_err);
++        return 0;
++    }
++    if (r < 0) V.sc_stale = 1;                   /* window not shown yet: retry at present */
++    V.win = win;
++    return 1;
++#undef FAIL
++}
++
++int vkp_prepare(struct SDL_Window *win) {
++    if (s_prepared) return 1;
++    if (!prepare_impl(win)) {
++        char why[256];
++        snprintf(why, sizeof why, "%s", V.status[0] ? V.status : "off (Vulkan setup failed)");
++        vkp_shutdown();
++        snprintf(V.status, sizeof V.status, "%s", why);
++        return 0;
++    }
++    s_prepared = 1;
++    return 1;
++}
++
++/* GL half: entry points, semaphore import, shared image. */
++int vkp_init(struct SDL_Window *win) {
++    if (V.on) return 1;
++    if (!s_prepared && !vkp_prepare(win)) return 0;
++    int ok = 0;
++    if (!load_gl()) {
++        snprintf(V.status, sizeof V.status, "off (GL lacks memory_object/semaphore_win32)");
++    } else {
++        import_semaphores_gl();
++        close_semaphore_handles();
++        int pw = 0, ph = 0;
++        SDL_GetWindowSizeInPixels(win, &pw, &ph);
++        if (pw <= 0 || ph <= 0) snprintf(V.status, sizeof V.status, "off (window has no size)");
++        else ok = create_shared(pw, ph);
++    }
++    if (!ok) {
++        char why[256];
++        snprintf(why, sizeof why, "%s", V.status);
++        vkp_shutdown();
++        snprintf(V.status, sizeof V.status, "%s", why);
++        return 0;
++    }
++    V.on = 1;
++    update_status();
++    return 1;
++}
++
++unsigned vkp_fbo(void) { return V.on ? V.gl_fbo : 0u; }
++const char *vkp_status(void) { return V.status[0] ? V.status : "off"; }
++
++void vkp_set_vsync(int interval) {
++    s_want_interval = interval;
++    if (V.on && pick_mode(s_want_interval) != V.mode) V.sc_stale = 1;
++}
++
++static void barrier(VkImage img, VkImageLayout from, VkImageLayout to, uint32_t src_q, uint32_t dst_q,
++                    VkAccessFlags src_a, VkAccessFlags dst_a, VkPipelineStageFlags src_s, VkPipelineStageFlags dst_s) {
++    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, src_a, dst_a, from, to, src_q, dst_q, img,
++                               { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    vkCmdPipelineBarrier(V.cb, src_s, dst_s, 0, 0, NULL, 0, NULL, 1, &b);
++}
++
++void vkp_present(void) {
++    if (!V.on) return;
++    /* GL: frame finished -> hand the shared image to Vulkan. */
++    GLenum_ to_src = VKP_GL_LAYOUT_TRANSFER_SRC;
++    gl.SignalSemaphoreEXT(V.gl_sem_gl_done, 0, NULL, 1, &V.gl_tex, &to_src);
++    gl.Flush();
++
++    if (V.fence_pending) {                       /* previous blit done: cb free */
++        vkWaitForFences(V.dev, 1, &V.fence, VK_TRUE, UINT64_MAX);
++        vkResetFences(V.dev, 1, &V.fence);
++        V.fence_pending = 0;
++    }
++    sync_child_size();
++    if (V.sc_stale || !V.sc) {
++        vkDeviceWaitIdle(V.dev);
++        if (create_swapchain() == 1) update_status();
++        else V.sc_stale = 1;
++    }
++    uint32_t idx = UINT32_MAX;
++    VkResult ar = VK_ERROR_OUT_OF_DATE_KHR;
++    if (V.sc && !V.sc_stale)
++        ar = vkAcquireNextImageKHR(V.dev, V.sc, 1000000000ull, V.acquire, VK_NULL_HANDLE, &idx);
++    const int have_img = (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR);
++    if (ar == VK_SUBOPTIMAL_KHR || ar == VK_ERROR_OUT_OF_DATE_KHR) V.sc_stale = 1;
++
++    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
++                                    VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    vkResetCommandBuffer(V.cb, 0);
++    vkBeginCommandBuffer(V.cb, &bi);
++    /* Acquire the shared image from GL (external queue family). */
++    barrier(V.sh_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            VK_QUEUE_FAMILY_EXTERNAL, V.qfi, 0, VK_ACCESS_TRANSFER_READ_BIT,
++            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++    if (have_img) {
++        barrier(V.sc_img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++        /* GL rows are bottom-up: flip Y. Same size, so NEAREST is exact. */
++        VkImageBlit blit = { { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, V.h, 0 }, { V.w, 0, 1 } },
++                             { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++                             { { 0, 0, 0 }, { (int32_t)V.sc_ext.width, (int32_t)V.sc_ext.height, 1 } } };
++        const int same = (uint32_t)V.w == V.sc_ext.width && (uint32_t)V.h == V.sc_ext.height;
++        vkCmdBlitImage(V.cb, V.sh_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.sc_img[idx],
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
++        barrier(V.sc_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
++                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    }
++    /* Release the shared image back to GL as a colour attachment. */
++    barrier(V.sh_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++            V.qfi, VK_QUEUE_FAMILY_EXTERNAL, VK_ACCESS_TRANSFER_READ_BIT, 0,
++            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    vkEndCommandBuffer(V.cb);
++
++    /* Always consume gl_done and signal vk_done, image or not, so the binary
++     * semaphore pair stays balanced. */
++    VkSemaphore waits[2] = { V.gl_done, V.acquire };
++    VkPipelineStageFlags ws[2] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT };
++    VkSemaphore sigs[2] = { V.vk_done, have_img ? V.present_sem[idx] : VK_NULL_HANDLE };
++    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, have_img ? 2u : 1u, waits, ws, 1, &V.cb,
++                        have_img ? 2u : 1u, sigs };
++    if (vkQueueSubmit(V.queue, 1, &si, V.fence) == VK_SUCCESS) V.fence_pending = 1;
++    if (have_img) {
++        VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &V.present_sem[idx], 1, &V.sc, &idx, NULL };
++        VkResult pr = vkQueuePresentKHR(V.queue, &pi);
++        if (pr == VK_SUBOPTIMAL_KHR || pr == VK_ERROR_OUT_OF_DATE_KHR) V.sc_stale = 1;
++    }
++
++    /* GL: wait (GPU-side) until Vulkan is done with the image. */
++    GLenum_ to_att = VKP_GL_LAYOUT_COLOR_ATTACHMENT;
++    gl.WaitSemaphoreEXT(V.gl_sem_vk_done, 0, NULL, 1, &V.gl_tex, &to_att);
++
++    /* Follow window resizes: the next frame draws into a matching image. */
++    int pw = 0, ph = 0;
++    SDL_GetWindowSizeInPixels(V.win, &pw, &ph);
++    if (pw > 0 && ph > 0 && (pw != V.w || ph != V.h)) {
++        gl.Finish();
++        if (V.fence_pending) {
++            vkWaitForFences(V.dev, 1, &V.fence, VK_TRUE, UINT64_MAX);
++            vkResetFences(V.dev, 1, &V.fence);
++            V.fence_pending = 0;
++        }
++        vkDeviceWaitIdle(V.dev);
++        destroy_shared();
++        if (!create_shared(pw, ph)) {
++            /* Can't continue on Vulkan: give the window back to GL. */
++            snprintf(V.status, sizeof V.status, "off (resize to %dx%d failed)", pw, ph);
++            V.on = 0;
++            return;
++        }
++        V.sc_stale = 1;
++        update_status();
++    }
++}
++
++#else  /* !PSX_VK_PRESENTER: inert */
++
++int vkp_prepare(struct SDL_Window *win) { (void)win; return 0; }
++int vkp_init(struct SDL_Window *win) { (void)win; return 0; }
++unsigned vkp_fbo(void) { return 0u; }
++void vkp_present(void) {}
++void vkp_set_vsync(int interval) { (void)interval; }
++void vkp_shutdown(void) {}
++const char *vkp_status(void) { return "off (not built: PSX_VK_PRESENTER)"; }
++
++#endif
