@@ -60,7 +60,10 @@ projections); the "~2 per render" seen in Phase 2 was a demo-footage quirk.
 - **Check-tool limitation:** large static overlays (results panel, HUD text)
   skew `mv_check.py` towards "assume still"; score a region clear of the
   overlay instead.
-- **Weapons and explosions:** the weapon fired in slot 2 produced no visible
-  projectile in the captured frames, so effect coverage is still untested.
+- ~~Weapons~~ **checked:** a missile fired from slot 2 (16 frames, best k = 1
+  in 15 of 15). The missile body is a small 3D object and gets its own motion
+  through the object path. Its large blue starburst glow is an additive sprite
+  and keeps the background's motion, as decided above. Explosions on impact
+  are still unseen.
 - **Speed classes:** cut thresholds were measured in this class; faster
   classes move further per render (still far below 1536 at ~300 now).
